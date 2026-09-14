@@ -42,13 +42,13 @@ function checkAndLiquidateDaps() {
 
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      const idInterno = row[0];
-      const monto = row[2];
-      const objetivoDAP = row[6] || "Sin Objetivo";
-      const fechaLiqRaw = row[7];
-      const liquidado = row[8];
-      const estadoCola = row[9];
-      const notionPageId = row[11];
+      const idInterno = row[DAP_COLS.ID_Interno - 1];
+      const monto = row[DAP_COLS.Monto - 1];
+      const objetivoDAP = row[DAP_COLS.Objetivo - 1] || "Sin Objetivo";
+      const fechaLiqRaw = row[DAP_COLS.Fecha_Liquidacion - 1];
+      const liquidado = row[DAP_COLS.Liquidado - 1];
+      const estadoCola = row[DAP_COLS.Estado_Cola - 1];
+      const notionPageId = row[DAP_COLS.Notion_Page_ID - 1];
 
       // Saltamos registros no elegibles (ya liquidados, sin fecha de liquidación o con cola incompleta)
       if (liquidado === true || !fechaLiqRaw || estadoCola !== 'COMPLETADO') {
@@ -73,9 +73,9 @@ function checkAndLiquidateDaps() {
           console.warn(`⚠️ Cron Job: DAP [${idInterno}] no posee Notion_Page_ID. Omitiendo actualización en Notion.`);
         }
 
-        // 2. Actualizar Google Sheets (Columna 9 -> Liquidado)
+        // 2. Actualizar Google Sheets (columna Liquidado)
         const rowIndex = i + 1;
-        sheet.getRange(rowIndex, 9).setValue(true);
+        sheet.getRange(rowIndex, DAP_COLS.Liquidado).setValue(true);
 
         dapsLiquidados.push({
           id: idInterno,

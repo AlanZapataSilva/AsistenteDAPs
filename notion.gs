@@ -60,20 +60,16 @@ function pushDapToNotion(dap) {
     muteHttpExceptions: true
   };
 
-  try {
-    const res = UrlFetchApp.fetch(url, options);
-    const code = res.getResponseCode();
-    
-    if (code === 200) {
-      const jsonRes = JSON.parse(res.getContentText());
-      console.info(`✅ Notion: DAP [${dap.ID_Operacion}] sincronizado correctamente.`);
-      return jsonRes.id; // Retorna el Notion Page ID (ej. 13ef5...)
-    } else {
-      console.error(`❌ Error Notion API (POST): Código ${code} - ${res.getContentText()}`);
-      return null;
-    }
-  } catch (e) {
-    console.error(`❌ Fallo de red en pushDapToNotion: ${e.message}`);
+  const res = _fetchWithRetry(url, options);
+  if (!res) return null;
+
+  const code = res.getResponseCode();
+  if (code === 200) {
+    const jsonRes = JSON.parse(res.getContentText());
+    console.info(`✅ Notion: DAP [${dap.ID_Operacion}] sincronizado correctamente.`);
+    return jsonRes.id; // Retorna el Notion Page ID (ej. 13ef5...)
+  } else {
+    console.error(`❌ Error Notion API (POST): Código ${code} - ${res.getContentText()}`);
     return null;
   }
 }
@@ -108,19 +104,15 @@ function updateNotionDapStatus(pageId) {
     muteHttpExceptions: true
   };
 
-  try {
-    const res = UrlFetchApp.fetch(url, options);
-    const code = res.getResponseCode();
-    
-    if (code === 200) {
-      console.info(`✅ Notion: DAP [${pageId}] marcado como liquidado remotamente.`);
-      return true;
-    } else {
-      console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);
-      return false;
-    }
-  } catch (e) {
-    console.error(`❌ Fallo de red en updateNotionDapStatus: ${e.message}`);
+  const res = _fetchWithRetry(url, options);
+  if (!res) return false;
+
+  const code = res.getResponseCode();
+  if (code === 200) {
+    console.info(`✅ Notion: DAP [${pageId}] marcado como liquidado remotamente.`);
+    return true;
+  } else {
+    console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);
     return false;
   }
 }

@@ -24,6 +24,7 @@ function installDapApp() {
     // Delegación de responsabilidades a funciones privadas
     _setupDatabase(ss);
     _setupGmailLabels();
+    _setupTriggers();
 
     console.log('🚀 Instalación del Microservicio DAP completada de forma segura.');
     
@@ -70,11 +71,41 @@ function _setupDatabase(ss) {
 function _setupGmailLabels() {
   const labelName = CONFIG.GMAIL.LABEL_DAP_PROCESSED;
   const existingLabel = GmailApp.getUserLabelByName(labelName);
-  
+
   if (!existingLabel) {
     GmailApp.createLabel(labelName);
     console.log(`✅ Etiqueta de Gmail creada: ${labelName}`);
   } else {
     console.log(`ℹ️ La etiqueta de Gmail ya existe: ${labelName}`);
+  }
+}
+
+/**
+ * Crea los triggers de tiempo requeridos por el microservicio si aún no existen.
+ * Idempotente: puede ejecutarse múltiples veces (ej. en reinstalaciones) sin duplicar triggers.
+ * @private
+ */
+function _setupTriggers() {
+  const existingHandlers = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
+
+  if (!existingHandlers.includes('processDapEmails')) {
+    ScriptApp.newTrigger('processDapEmails')
+      .timeBased()
+      .everyMinutes(15)
+      .create();
+    console.log('✅ Trigger creado: processDapEmails (cada 15 min).');
+  } else {
+    console.log('ℹ️ Trigger processDapEmails ya existe.');
+  }
+
+  if (!existingHandlers.includes('checkAndLiquidateDaps')) {
+    ScriptApp.newTrigger('checkAndLiquidateDaps')
+      .timeBased()
+      .everyDays(1)
+      .atHour(8)
+      .create();
+    console.log('✅ Trigger creado: checkAndLiquidateDaps (diario, 08:00 America/Santiago).');
+  } else {
+    console.log('ℹ️ Trigger checkAndLiquidateDaps ya existe.');
   }
 }

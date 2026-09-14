@@ -96,7 +96,7 @@ function processDapEmails() {
  * Calcula secuencialmente el siguiente ID Interno disponible en la base de datos.
  * @private
  * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de cálculo de DAPs.
- * @returns {string} ID formateado (Ej: DAP-001, DAP-042).
+ * @returns {number} Entero secuencial simple (Ej: 1, 2, 42), sin prefijo.
  */
 function _generateNextInternalId(sheet) {
   const lastRow = sheet.getLastRow();

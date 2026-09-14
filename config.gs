@@ -48,3 +48,16 @@ const CONFIG = Object.freeze({
     LABEL_DAP_PROCESSED: 'SaaS_Inversiones/DAP_Procesado'
   }
 });
+
+/**
+ * Índices de columna (base 1, aptos para Range.getRange) derivados de CONFIG.HEADERS.DAPS.
+ * Evita "números mágicos" repetidos y mantiene el acceso a columnas sincronizado
+ * automáticamente si el orden de HEADERS.DAPS cambia.
+ * @constant {Object}
+ */
+const DAP_COLS = Object.freeze(
+  CONFIG.HEADERS.DAPS.reduce((acc, header, index) => {
+    acc[header] = index + 1;
+    return acc;
+  }, {})
+);

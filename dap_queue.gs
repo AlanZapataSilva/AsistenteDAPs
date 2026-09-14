@@ -24,28 +24,36 @@ function pingNextPendingDap() {
   }
 
   try {
+    // Evitamos pisar una conversación FSM en curso: si ya hay un DAP activo en
+    // caché, no debemos avanzar la cola (dejaría esa fila huérfana en
+    // ESPERANDO_TELEGRAM para siempre, ya que el caché perdería su referencia).
+    const cache = CacheService.getScriptCache();
+    if (cache.get(`${chatId}_ACTIVE_DAP`)) {
+      console.info('ℹ️ Cola: Ya existe una conversación DAP activa en caché. Se pospone el avance de la cola.');
+      return;
+    }
+
     const ss = SpreadsheetApp.openById(spreadsheetId);
     const sheet = ss.getSheetByName(CONFIG.SHEETS.DAPS);
     const data = sheet.getDataRange().getValues();
-    
+
     // Iteramos desde la fila 2 (saltando los encabezados)
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      const estadoCola = row[9]; // Índice 9 -> Columna J
-      
+      const estadoCola = row[DAP_COLS.Estado_Cola - 1];
+
       if (estadoCola === 'PENDIENTE_OBJETIVO') {
-        const idInterno = row[0];
-        const monto = row[2];
-        const tipoDap = row[3];
-        const fecVencimientoRaw = row[5];
-        
+        const idInterno = row[DAP_COLS.ID_Interno - 1];
+        const monto = row[DAP_COLS.Monto - 1];
+        const tipoDap = row[DAP_COLS.Tipo_DAP - 1];
+        const fecVencimientoRaw = row[DAP_COLS.Fecha_Vencimiento - 1];
+
         // 1. Prevención de Concurrencia: Mutamos el estado en Sheets inmediatamente
         const rowIndex = i + 1;
-        sheet.getRange(rowIndex, 10).setValue('ESPERANDO_TELEGRAM');
+        sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue('ESPERANDO_TELEGRAM');
         SpreadsheetApp.flush();
         
         // 2. Preparación de la Máquina de Estados (FSM) en Caché
-        const cache = CacheService.getScriptCache();
         const TTL_SECONDS = 21600; // 6 horas de validez de la sesión
         
         // Forzamos String() para evitar fallos de Type Coercion al comparar más adelante

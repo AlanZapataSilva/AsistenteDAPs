@@ -47,16 +47,12 @@ function sendTelegramMessage(chatId, text) {
     parse_mode: 'HTML' 
   };
   
-  try {
-    UrlFetchApp.fetch(url, {
-      method: 'post', 
-      contentType: 'application/json',
-      payload: JSON.stringify(payload), 
-      muteHttpExceptions: true
-    });
-  } catch (e) {
-    console.error(`Fallo de red saliente en sendTelegramMessage: ${e.message}`);
-  }
+  _fetchWithRetry(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
 }
 
 /**
@@ -144,7 +140,7 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
   
   // Buscar la fila exacta del DAP activo en la caché
   for (let i = 1; i < data.length; i++) {
-    const idEnHoja = data[i][0] ? parseInt(data[i][0], 10) : null;
+    const idEnHoja = data[i][DAP_COLS.ID_Interno - 1] ? parseInt(data[i][DAP_COLS.ID_Interno - 1], 10) : null;
     const idEnCache = parseInt(activeDapId, 10);
 
     if (idEnHoja !== null && idEnHoja === idEnCache) {
@@ -161,22 +157,22 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
 
   // Lógica de transición de estados
   if (step === 'ESPERANDO_OBJETIVO') {
-    sheet.getRange(rowIndex, 7).setValue(text); // Columna Objetivo
-    
-    const tipoDap = dapRow[3];
+    sheet.getRange(rowIndex, DAP_COLS.Objetivo).setValue(text);
+
+    const tipoDap = dapRow[DAP_COLS.Tipo_DAP - 1];
     if (tipoDap === 'RENOVABLE') {
       cache.put(`${chatId}_DAP_STEP`, 'ESPERANDO_LIQUIDACION', 21600);
       sendTelegramMessage(chatId, "🔄 Como es un DAP <b>RENOVABLE</b>, por favor indícame la Fecha Tentativa de Liquidación (Formato: YYYY-MM-DD).\n<i>Si no tienes fecha aún, responde 'saltar'.</i>");
     } else {
       // DAP Fijo: Fecha de liquidación hereda el vencimiento
-      const fechaVencimiento = Utilities.formatDate(new Date(dapRow[5]), Session.getScriptTimeZone(), "yyyy-MM-dd");
-      sheet.getRange(rowIndex, 8).setValue(fechaVencimiento); 
+      const fechaVencimiento = Utilities.formatDate(new Date(dapRow[DAP_COLS.Fecha_Vencimiento - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd");
+      sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaVencimiento);
       finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
     }
-    
+
   } else if (step === 'ESPERANDO_LIQUIDACION') {
     const fechaLiq = text.toLowerCase() === 'saltar' ? "" : text;
-    sheet.getRange(rowIndex, 8).setValue(fechaLiq);
+    sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaLiq);
     finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
   }
 }
@@ -196,23 +192,23 @@ function finalizeDap(chatId, activeDapId, rowIndex, sheet, cache) {
   const row = data[rowIndex - 1]; 
   
   const dapDto = {
-    ID_Interno: row[0],
-    ID_Operacion: row[1],
-    Monto: row[2],
-    Tipo_DAP: row[3],
-    Fecha_Inicio: Utilities.formatDate(new Date(row[4]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
-    Fecha_Vencimiento: Utilities.formatDate(new Date(row[5]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
-    Objetivo: row[6],
-    Fecha_Liquidacion: row[7] ? Utilities.formatDate(new Date(row[7]), Session.getScriptTimeZone(), "yyyy-MM-dd") : null,
-    Liquidado: row[8]
+    ID_Interno: row[DAP_COLS.ID_Interno - 1],
+    ID_Operacion: row[DAP_COLS.ID_Operacion - 1],
+    Monto: row[DAP_COLS.Monto - 1],
+    Tipo_DAP: row[DAP_COLS.Tipo_DAP - 1],
+    Fecha_Inicio: Utilities.formatDate(new Date(row[DAP_COLS.Fecha_Inicio - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
+    Fecha_Vencimiento: Utilities.formatDate(new Date(row[DAP_COLS.Fecha_Vencimiento - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
+    Objetivo: row[DAP_COLS.Objetivo - 1],
+    Fecha_Liquidacion: row[DAP_COLS.Fecha_Liquidacion - 1] ? Utilities.formatDate(new Date(row[DAP_COLS.Fecha_Liquidacion - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd") : null,
+    Liquidado: row[DAP_COLS.Liquidado - 1]
   };
 
   const notionPageId = pushDapToNotion(dapDto);
-  
+
   // Actualizar Sheets
-  sheet.getRange(rowIndex, 10).setValue('COMPLETADO');
+  sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue('COMPLETADO');
   if (notionPageId) {
-    sheet.getRange(rowIndex, 12).setValue(notionPageId);
+    sheet.getRange(rowIndex, DAP_COLS.Notion_Page_ID).setValue(notionPageId);
     sendTelegramMessage(chatId, `✅ <b>¡DAP ${activeDapId} registrado exitosamente!</b>\nObjetivo: ${dapDto.Objetivo}`);
   } else {
     sendTelegramMessage(chatId, "⚠️ Se guardó en Sheets, pero hubo un error enviando a Notion.");
@@ -237,9 +233,9 @@ function forceLiquidateDap(chatId, idInterno) {
   let notionPageId = "";
 
   for (let i = 1; i < data.length; i++) {
-    if (data[i][0] && parseInt(data[i][0], 10) === parseInt(idInterno, 10)) {
+    if (data[i][DAP_COLS.ID_Interno - 1] && parseInt(data[i][DAP_COLS.ID_Interno - 1], 10) === parseInt(idInterno, 10)) {
       rowIndex = i + 1;
-      notionPageId = data[i][11];
+      notionPageId = data[i][DAP_COLS.Notion_Page_ID - 1];
       break;
     }
   }
@@ -255,7 +251,7 @@ function forceLiquidateDap(chatId, idInterno) {
     notionMsg = success ? "\n✅ <i>Base de datos de Notion actualizada.</i>" : "\n⚠️ <i>Falló la actualización en Notion.</i>";
   }
 
-  sheet.getRange(rowIndex, 9).setValue(true); // Checkbox Liquidado
+  sheet.getRange(rowIndex, DAP_COLS.Liquidado).setValue(true);
   SpreadsheetApp.flush();
 
   sendTelegramMessage(chatId, `✅ <b>DAP ${idInterno}</b> marcado como liquidado manualmente.` + notionMsg);
