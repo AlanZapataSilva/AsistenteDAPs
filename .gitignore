@@ -12,3 +12,5 @@ package-lock.json
 .eslintrc.json
 .clasp.json.example
 tests/
+AGENTS.md
+CHANGES.md
