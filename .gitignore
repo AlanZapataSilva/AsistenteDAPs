@@ -1,0 +1,15 @@
+node_modules/
+.clasp.json
+*.log
+.env
+
+# --- Tooling de desarrollo local: se mantiene fuera del repo a propósito ---
+# Solo se sincroniza a GAS el código .gs + appsscript.json + documentación .md.
+# El tooling (npm/eslint/jest/clasp) sigue funcionando en este equipo desde disco.
+# Ver CHANGES.md para el detalle. Regla: todo archivo NO .md que no sea parte del
+# runtime de Apps Script (.gs, appsscript.json) se agrega aquí.
+package.json
+package-lock.json
+.eslintrc.json
+.clasp.json.example
+tests/
