@@ -38,6 +38,80 @@ function _fetchWithRetry(url, options, maxRetries) {
     }
   }
 
-  console.error(`❌ _fetchWithRetry: Todos los intentos fallaron para ${url}. Último error: ${lastError}`);
+  console.error(`❌ _fetchWithRetry: Todos los intentos fallaron para ${_redactUrl(url)}. Último error: ${lastError}`);
   return null;
+}
+
+/**
+ * Oculta secretos de una URL antes de loguearla: quita el query string (ej. `apikey=`) y el
+ * token del bot de Telegram que viaja en el path (`/bot<token>/`).
+ * @private
+ * @param {string} url - URL original.
+ * @returns {string} URL segura para logs.
+ */
+function _redactUrl(url) {
+  return String(url).split('?')[0].replace(/\/bot[^/]+\//, '/bot***/');
+}
+
+/**
+ * Indica si un valor es un objeto Date. Se usa toString en vez de `instanceof Date` porque
+ * los valores que devuelve Sheets (`getValues`) vienen de otro contexto de ejecución y
+ * `instanceof Date` da false aunque sean fechas.
+ * @private
+ * @param {*} value - Valor a evaluar.
+ * @returns {boolean}
+ */
+function _isDateObject(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
+/**
+ * Normaliza un valor de fecha (Date de Sheets o texto) a `yyyy-MM-dd`, sin desfases de zona
+ * horaria (un texto `yyyy-MM-dd` se devuelve tal cual, en vez de pasar por `new Date()`,
+ * que lo interpretaría en UTC y podría correr el día).
+ * @private
+ * @param {Date|string|null} value - Fecha de Sheets o texto.
+ * @returns {string} Fecha ISO, o cadena vacía si el valor está vacío.
+ */
+function _toIsoDate(value) {
+  if (value === null || value === undefined || value === '') return '';
+  if (_isDateObject(value)) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  const text = String(value).trim();
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const parsed = new Date(text);
+  return isNaN(parsed.getTime()) ? text : Utilities.formatDate(parsed, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+/**
+ * Formatea una fecha ISO como texto legible en español: `Jueves 02/Abril/2026`.
+ * @private
+ * @param {Date|string} value - Fecha (ISO o Date de Sheets).
+ * @returns {string} Fecha legible, o el valor original si no se puede interpretar.
+ */
+function _formatDateLong(value) {
+  const iso = _toIsoDate(value);
+  const parts = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!parts) return iso;
+
+  const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  const months = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+  const year = parseInt(parts[1], 10);
+  const month = parseInt(parts[2], 10);
+  const day = parseInt(parts[3], 10);
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+
+  return `${days[weekday]} ${parts[3]}/${months[month - 1]}/${year}`;
+}
+
+/**
+ * Convierte un número en formato chileno (`1.234,5678`: punto de miles, coma decimal) a Number.
+ * @private
+ * @param {string} text - Texto numérico.
+ * @returns {number} Valor numérico, o NaN si no se puede interpretar.
+ */
+function _parseChileanNumber(text) {
+  return parseFloat(String(text).replace(/\./g, '').replace(',', '.'));
 }

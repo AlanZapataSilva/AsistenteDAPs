@@ -15,6 +15,8 @@ Data Pipeline:
 - **Daily Liquidation Trigger**: `checkAndLiquidateDaps()` (`dap_cron.gs`) — Scheduled daily time-driven trigger.
 - **Webhook Endpoint**: `doPost(e)` (`telegram.gs`) — Receives Telegram updates.
 - **Historical Backfill**: `backfillDapEmails(monthsBack, maxThreads)` (`dap_extractor.gs`) — Manual one-off run to reprocess emails outside the normal 30-day window. Safe to re-run (Gmail label exclusion prevents duplicates).
+- **Queue Release**: `releaseDapQueue()` (`dap_maintenance.gs`) — Manual: clears the FSM cache keys, returns `ESPERANDO_TELEGRAM` rows to `PENDIENTE_OBJETIVO` and re-runs the queue. Use after interrupting Telegram conversations.
+- **UF Repair**: `repairUfDapAmounts()` (dry-run, log only) then `repairUfDapAmountsApply()` (`dap_maintenance.gs`) — Manual: re-parses every row's email, recomputes the CLP amount of UF DAPs and fixes Sheet + Notion `Monto` (includes `COMPLETADO` rows).
 - **Data Repair**: `auditPendingDapOperaciones()` (`dap_maintenance.gs`) — Manual one-off run after a `dap_parser.gs` fix: re-parses the original email (via `ID_Mensaje_Email`) for every row not yet `COMPLETADO` and corrects `ID_Operacion` if it no longer matches. Never touches `COMPLETADO` rows (may already be synced to Notion).
 
 ## Environment Variables (`PropertiesService.getScriptProperties()`)
@@ -27,6 +29,7 @@ Retrieved via `getEnv(key)` defined in `config.gs`. Required keys:
 - `WEB_APP_URL`: URL of deployed GAS Web App.
 - `NOTION_API_TOKEN`: Notion Integration Bearer token.
 - `NOTION_DAP_DATABASE_ID`: Notion target database UUID.
+- `CMF_API_KEY`: API key of the CMF (Chile) used to fetch the UF value (`uf.gs`). Script Property only — never in code, logs or the repo.
 
 ## Storage, Schema & Queue Protocol
 
@@ -46,6 +49,11 @@ Retrieved via `getEnv(key)` defined in `config.gs`. Required keys:
 - **Outbound HTTP**: `sendTelegramMessage`, `pushDapToNotion`, and `updateNotionDapStatus` go through `_fetchWithRetry()` (`utils.gs`), which retries on network exceptions/5xx and gives up immediately on 4xx.
 - **Notion Upsert**: `pushDapToNotion()` (`notion.gs`) looks up the DAP by `ID operación` (`_findNotionPageByOperacion`) before creating. If found, it complements only empty fields and upgrades `Liquidado` false→true (never the reverse, never overwrites a present value) instead of creating a duplicate page. Relies on `ID_Operacion` being extracted correctly — see next point.
 - **Email Regex Line-Crossing**: In `dap_parser.gs`, `[^\d]` character classes match newlines too. A bare `[^\d]*` gap between a label and its value can silently cross into an unrelated table row/section if a generic fallback alternative (e.g. `Operaci.n`) matches earlier in the email than the intended field (e.g. a "Detalle de la operación" heading before the real data table) — this actually happened in production (captured "N° Transacción" instead of "N° Depósito"). All label→value gaps in `MONTO`, `FECHA_INICIO`, `FECHA_VENCIMIENTO`, and `OPERACION_CANDIDATES` use `(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*` instead: allows the label and value to be on the same line OR adjacent lines, but never further apart. `OPERACION_CANDIDATES` is also tried as a priority-ordered list (first pattern that matches anywhere wins), not a single combined alternation, specifically to avoid leftmost-match picking a less-specific alternative over a more reliable one. Don't revert to a single unbounded `[^\d]*` or a combined alternation for these fields.
+- **Sheets Dates**: Values from `getValues()` come from another realm, so `instanceof Date` is `false`. Never use it (nor `new Date("yyyy-MM-dd")`, which is parsed as UTC and can shift the day). Use `_toIsoDate()` / `_isDateObject()` / `_formatDateLong()` (`utils.gs`). This bug made Telegram show raw `Date.toString()` output and would have kept `checkAndLiquidateDaps()` from ever liquidating.
+- **UF DAPs**: `parseBciDapEmail` detects `Moneda` (UF vs CLP) and keeps the parser pure (no network); `Monto` is `null` for UF until `_enrichWithClpAmount()` (`uf.gs`) converts it using the UF value of the capture date (`getUfValue`, CMF API, cached). If the UF value can't be fetched, the extractor does not enqueue the message nor label its thread, so it is retried on the next run. `UF 4,4379` uses decimal comma — `_parseChileanNumber`.
+- **Log Redaction**: `_fetchWithRetry` logs URLs through `_redactUrl` (strips query string and `/bot<token>/`). Any new integration must not put secrets in logged text.
+- **Queue Self-Healing**: `ACTIVE_DAP` expires after 6 h. Once the cache guard passes, `pingNextPendingDap()` treats `ESPERANDO_TELEGRAM` rows as orphaned and re-asks them (it used to only look at `PENDIENTE_OBJETIVO`).
+- **Duplicate Messages**: `_runDapEmailExtraction` skips messages whose `ID_Mensaje_Email` is already in the sheet, so a retried thread never duplicates rows.
 - **Code Style**: Vanilla modern JS (ES6+, `'use strict'`), JSDoc comments, private helpers prefixed with `_`.
 
 ## Local Development

@@ -55,13 +55,8 @@ function checkAndLiquidateDaps() {
         continue;
       }
 
-      // Estandarización de la fecha de liquidación
-      let fechaLiqStr = "";
-      if (fechaLiqRaw instanceof Date) {
-        fechaLiqStr = Utilities.formatDate(fechaLiqRaw, Session.getScriptTimeZone(), "yyyy-MM-dd");
-      } else {
-        fechaLiqStr = String(fechaLiqRaw).trim();
-      }
+      // Estandarización de la fecha de liquidación (Date de Sheets o texto) a yyyy-MM-dd
+      const fechaLiqStr = _toIsoDate(fechaLiqRaw);
 
       // Evaluación de maduración (si la fecha llegó o es del pasado)
       if (fechaLiqStr && fechaLiqStr <= todayStr) {

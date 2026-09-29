@@ -222,26 +222,40 @@ function _complementExistingNotionPage(token, existingPage, dap) {
  * @returns {boolean} true si la mutación fue exitosa, false si falló.
  */
 function updateNotionDapStatus(pageId) {
+  return patchNotionPageProperties(pageId, { "Liquidado": { checkbox: true } });
+}
+
+/**
+ * Sobrescribe el campo "Monto" (en CLP) de una página de Notion. Solo lo usa la reparación
+ * manual de DAP en UF; el upsert normal (`pushDapToNotion`) nunca pisa valores existentes.
+ * @param {string} pageId - El ID único de la página en Notion.
+ * @param {number} monto - Monto en CLP.
+ * @returns {boolean} true si la mutación fue exitosa, false si falló.
+ */
+function updateNotionDapAmount(pageId, monto) {
+  return patchNotionPageProperties(pageId, { "Monto": { number: monto } });
+}
+
+/**
+ * Aplica un PATCH a las propiedades indicadas de una página de Notion (solo esas se modifican).
+ * @param {string} pageId - El ID único de la página en Notion.
+ * @param {Object} properties - Propiedades a mutar, en el formato de la API de Notion.
+ * @returns {boolean} true si la mutación fue exitosa, false si falló.
+ */
+function patchNotionPageProperties(pageId, properties) {
   const token = getEnv('NOTION_API_TOKEN');
-  
+
   if (!token || !pageId) {
-    console.error('❌ Notion API: Falta Token o Page ID para actualizar el estado.');
+    console.error('❌ Notion API: Falta Token o Page ID para actualizar la página.');
     return false;
   }
 
   const url = `https://api.notion.com/v1/pages/${pageId}`;
-  
-  // Enviamos SOLO la propiedad que queremos mutar
-  const payload = {
-    properties: {
-      "Liquidado": { checkbox: true }
-    }
-  };
 
   const options = {
     method: 'patch',
     headers: _getNotionHeaders(token),
-    payload: JSON.stringify(payload),
+    payload: JSON.stringify({ properties: properties }),
     muteHttpExceptions: true
   };
 
@@ -250,7 +264,7 @@ function updateNotionDapStatus(pageId) {
 
   const code = res.getResponseCode();
   if (code === 200) {
-    console.info(`✅ Notion: DAP [${pageId}] marcado como liquidado remotamente.`);
+    console.info(`✅ Notion: página [${pageId}] actualizada (${Object.keys(properties).join(', ')}).`);
     return true;
   } else {
     console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);

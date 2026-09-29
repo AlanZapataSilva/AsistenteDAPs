@@ -84,43 +84,62 @@ function _runDapEmailExtraction({ query, maxThreads, flushEveryThreads }) {
   }
 
   let dapsProcesados = 0;
+  const existingMessageIds = _getExistingMessageIds(sheet);
 
   try {
     threads.forEach((thread, index) => {
       const messages = thread.getMessages();
+      let threadCompleto = true;
 
       messages.forEach((msg) => {
+        // Si el mensaje ya está en la hoja (ej. un reintento tras un fallo parcial), no lo duplicamos
+        if (existingMessageIds.has(msg.getId())) return;
+
         const dapDto = parseBciDapEmail(msg);
 
         if (dapDto) {
+          if (!_enrichWithClpAmount(dapDto)) {
+            // Sin valor UF no podemos calcular el monto en CLP: no encolamos ni etiquetamos el hilo
+            // para que se reintente en la próxima ejecución.
+            threadCompleto = false;
+            return;
+          }
+
           const idInterno = _generateNextInternalId(sheet);
 
-          // Inserción en Sheets respetando estrictamente el orden de los HEADERS
-          sheet.appendRow([
-            idInterno,
-            dapDto.ID_Operacion,
-            dapDto.Monto,
-            dapDto.Tipo_DAP,
-            dapDto.Fecha_Inicio,
-            dapDto.Fecha_Vencimiento,
-            "",                     // Objetivo (Pendiente)
-            "",                     // Fecha_Liquidacion (Pendiente)
-            false,                  // Liquidado
-            "PENDIENTE_OBJETIVO",   // Estado_Cola
-            msg.getId(),            // ID_Mensaje_Email
-            ""                      // Notion_Page_ID
-          ]);
+          // Inserción en Sheets: los valores se ordenan según CONFIG.HEADERS.DAPS (no por posición fija)
+          const valores = {
+            ID_Interno: idInterno,
+            ID_Operacion: dapDto.ID_Operacion,
+            Monto: dapDto.Monto,
+            Tipo_DAP: dapDto.Tipo_DAP,
+            Fecha_Inicio: dapDto.Fecha_Inicio,
+            Fecha_Vencimiento: dapDto.Fecha_Vencimiento,
+            Objetivo: '',
+            Fecha_Liquidacion: '',
+            Liquidado: false,
+            Estado_Cola: 'PENDIENTE_OBJETIVO',
+            ID_Mensaje_Email: msg.getId(),
+            Notion_Page_ID: '',
+            Moneda: dapDto.Moneda,
+            Monto_Original: dapDto.Monto_Original,
+            Valor_UF: dapDto.Valor_UF || ''
+          };
+          sheet.appendRow(CONFIG.HEADERS.DAPS.map((header) => valores[header]));
+          existingMessageIds.add(msg.getId());
 
           dapsProcesados++;
-          console.info(`✅ DAP Encolado exitosamente: ${idInterno} | Operación: ${dapDto.ID_Operacion}`);
+          console.info(`✅ DAP Encolado exitosamente: ${idInterno} | Operación: ${dapDto.ID_Operacion} | ${dapDto.Moneda}`);
         } else {
           console.warn(`⚠️ Fallo de extracción: El parser retornó null para el mensaje ID: ${msg.getId()}`);
         }
       });
 
-      // Aplicar etiqueta de idempotencia al hilo completo
-      const label = GmailApp.getUserLabelByName(labelName);
-      if (label) thread.addLabel(label);
+      // Aplicar etiqueta de idempotencia al hilo completo (solo si todos sus mensajes se resolvieron)
+      if (threadCompleto) {
+        const label = GmailApp.getUserLabelByName(labelName);
+        if (label) thread.addLabel(label);
+      }
 
       if (flushEveryThreads && (index + 1) % flushEveryThreads === 0) {
         SpreadsheetApp.flush();
@@ -141,6 +160,20 @@ function _runDapEmailExtraction({ query, maxThreads, flushEveryThreads }) {
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * Lee de la hoja los IDs de mensaje de Gmail ya registrados.
+ * @private
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de cálculo de DAPs.
+ * @returns {Set<string>} IDs de mensaje presentes en la columna ID_Mensaje_Email.
+ */
+function _getExistingMessageIds(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return new Set();
+
+  const values = sheet.getRange(2, DAP_COLS.ID_Mensaje_Email, lastRow - 1, 1).getValues();
+  return new Set(values.map((row) => String(row[0])).filter((id) => id !== ''));
 }
 
 /**

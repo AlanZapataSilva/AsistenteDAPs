@@ -40,7 +40,10 @@ const CONFIG = Object.freeze({
       'Liquidado', 
       'Estado_Cola', 
       'ID_Mensaje_Email',
-      'Notion_Page_ID'
+      'Notion_Page_ID',
+      'Moneda',
+      'Monto_Original',
+      'Valor_UF'
     ]
   },
   GMAIL: {

@@ -61,7 +61,35 @@ function _setupDatabase(ss) {
     console.log(`✅ Hoja de base de datos creada exitosamente: ${CONFIG.SHEETS.DAPS}`);
   } else {
     console.log(`ℹ️ La hoja ${CONFIG.SHEETS.DAPS} ya existe en el documento.`);
+    _addMissingHeaders(sheet);
   }
+}
+
+/**
+ * Agrega al final de la fila de encabezados las columnas de CONFIG.HEADERS.DAPS que aún no
+ * existan (migración idempotente para hojas creadas antes de agregar columnas nuevas).
+ * Las filas existentes quedan con esas celdas vacías.
+ * @private
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de DAPs existente.
+ */
+function _addMissingHeaders(sheet) {
+  const expected = CONFIG.HEADERS.DAPS;
+  const currentWidth = Math.max(sheet.getLastColumn(), 1);
+  const current = sheet.getRange(1, 1, 1, currentWidth).getValues()[0];
+
+  expected.forEach((header, index) => {
+    if (current[index] === header) return;
+    if (current[index] !== undefined && current[index] !== '') {
+      console.warn(`⚠️ Encabezado inesperado en la columna ${index + 1}: "${current[index]}" (se esperaba "${header}"). No se modifica.`);
+      return;
+    }
+    sheet.getRange(1, index + 1)
+         .setValue(header)
+         .setBackground('#0f9d58')
+         .setFontColor('#FFFFFF')
+         .setFontWeight('bold');
+    console.log(`✅ Encabezado agregado: "${header}" (columna ${index + 1}).`);
+  });
 }
 
 /**

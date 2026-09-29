@@ -165,7 +165,7 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
       sendTelegramMessage(chatId, "🔄 Como es un DAP <b>RENOVABLE</b>, por favor indícame la Fecha Tentativa de Liquidación (Formato: YYYY-MM-DD).\n<i>Si no tienes fecha aún, responde 'saltar'.</i>");
     } else {
       // DAP Fijo: Fecha de liquidación hereda el vencimiento
-      const fechaVencimiento = Utilities.formatDate(new Date(dapRow[DAP_COLS.Fecha_Vencimiento - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd");
+      const fechaVencimiento = _toIsoDate(dapRow[DAP_COLS.Fecha_Vencimiento - 1]);
       sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaVencimiento);
       finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
     }
@@ -196,10 +196,10 @@ function finalizeDap(chatId, activeDapId, rowIndex, sheet, cache) {
     ID_Operacion: row[DAP_COLS.ID_Operacion - 1],
     Monto: row[DAP_COLS.Monto - 1],
     Tipo_DAP: row[DAP_COLS.Tipo_DAP - 1],
-    Fecha_Inicio: Utilities.formatDate(new Date(row[DAP_COLS.Fecha_Inicio - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
-    Fecha_Vencimiento: Utilities.formatDate(new Date(row[DAP_COLS.Fecha_Vencimiento - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
+    Fecha_Inicio: _toIsoDate(row[DAP_COLS.Fecha_Inicio - 1]),
+    Fecha_Vencimiento: _toIsoDate(row[DAP_COLS.Fecha_Vencimiento - 1]),
     Objetivo: row[DAP_COLS.Objetivo - 1],
-    Fecha_Liquidacion: row[DAP_COLS.Fecha_Liquidacion - 1] ? Utilities.formatDate(new Date(row[DAP_COLS.Fecha_Liquidacion - 1]), Session.getScriptTimeZone(), "yyyy-MM-dd") : null,
+    Fecha_Liquidacion: _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]) || null,
     Liquidado: row[DAP_COLS.Liquidado - 1]
   };
 

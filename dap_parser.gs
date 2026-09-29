@@ -8,7 +8,10 @@
  * DTO (Data Transfer Object) representativo de un Depósito a Plazo.
  * @typedef {Object} DapDTO
  * @property {string} ID_Operacion - Número de comprobante de la operación.
- * @property {number} Monto - Valor numérico entero de la inversión.
+ * @property {string} Moneda - Moneda del DAP: 'CLP' o 'UF'.
+ * @property {number} Monto_Original - Monto en la moneda original del correo (CLP entero, o UF con decimales).
+ * @property {number|null} Monto - Monto en CLP (entero). Para DAP en UF es null hasta convertirlo con `_enrichWithClpAmount`.
+ * @property {number} [Valor_UF] - Valor de la UF usado en la conversión (solo DAP en UF, tras convertir).
  * @property {string} Tipo_DAP - Clasificación del DAP (FIJO o RENOVABLE).
  * @property {string} Fecha_Inicio - Fecha de toma en formato YYYY-MM-DD.
  * @property {string} Fecha_Vencimiento - Fecha de maduración en formato YYYY-MM-DD.
@@ -29,8 +32,12 @@ const DAP_BCI_LOGIC = Object.freeze({
   // de saltos de línea, terminar capturando un número de una fila completamente distinta de
   // la tabla en vez de fallar limpiamente o encontrar el valor correcto.
   REGEX: {
-    // Atrapa "Monto Inversión", saltando posibles caracteres de codificación (=C3=B3)
-    MONTO: /(?:Monto Inversi.*n|Monto|Capital)(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*\$?\s*([\d.,]+)/i,
+    // Atrapa "Monto Inversión", saltando posibles caracteres de codificación (=C3=B3).
+    // Grupo 1: prefijo entre la etiqueta y el número (ej. "$ " o "UF "), usado para detectar
+    // la moneda. Grupo 2: el número (CLP: "61.000"; UF: "4,4379").
+    MONTO: /(?:Monto Inversi.*n|Monto|Capital)(?:[^\d\r\n]*\r?\n)?([^\d\r\n]*)([\d.,]+)/i,
+    // Campo "Moneda" de la tabla (valor "UF" o "Pesos"); señal adicional a la del prefijo del monto
+    MONEDA: /Moneda(?:[^\r\n]*\r?\n)?[^A-Za-z\r\n]*(UF|Pesos)\b/i,
     // Atrapa "Tipo de Documento" y busca la palabra "Fijo" o "Renovable"
     TIPO: /(?:Tipo de Documento|Tipo de Dep.sito|Tipo)[\s\S]*?(Fijo|Renovable)/i,
     FECHA_INICIO: /(?:Fecha de Captaci.*n|Fecha de Toma|Fecha Inicio|Emisi.n)(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*([\d/-]{10})/i,
@@ -86,6 +93,7 @@ function parseBciDapEmail(message) {
     const regex = DAP_BCI_LOGIC.REGEX;
 
     const matchMonto = body.match(regex.MONTO);
+    const matchMoneda = body.match(regex.MONEDA);
     const idOperacion = _extractIdOperacion(body);
     const matchTipo = body.match(regex.TIPO);
     const matchInicio = body.match(regex.FECHA_INICIO);
@@ -96,14 +104,22 @@ function parseBciDapEmail(message) {
       return null;
     }
 
-    // Limpieza de datos
-    const montoNumerico = parseInt(matchMonto[1].replace(/[^\d]/g, ''), 10);
+    // Moneda: UF si el prefijo del monto o el campo "Moneda" lo indican; en otro caso CLP.
+    // UF usa coma decimal ("4,4379"); CLP es un entero con puntos de miles ("61.000").
+    const esUF = /\bUF\b/i.test(matchMonto[1]) || (matchMoneda !== null && /^UF$/i.test(matchMoneda[1]));
+    const moneda = esUF ? 'UF' : 'CLP';
+    const montoOriginal = esUF
+      ? _parseChileanNumber(matchMonto[2])
+      : parseInt(matchMonto[2].replace(/[^\d]/g, ''), 10);
     const tipoLimpio = matchTipo ? matchTipo[1].trim().toUpperCase() : 'FIJO';
     const messageDate = message.getDate();
 
     return {
       ID_Operacion: idOperacion.trim(),
-      Monto: montoNumerico,
+      Moneda: moneda,
+      Monto_Original: montoOriginal,
+      // En UF el monto en CLP se calcula después (requiere consultar el valor de la UF a la fecha de captación)
+      Monto: esUF ? null : montoOriginal,
       Tipo_DAP: tipoLimpio,
       Fecha_Inicio: _normalizeDate(matchInicio ? matchInicio[1] : null, messageDate),
       Fecha_Vencimiento: _normalizeDate(matchVencimiento ? matchVencimiento[1] : null, messageDate)

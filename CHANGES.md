@@ -1,5 +1,28 @@
 # Registro de cambios
 
+## 2026-09-29 — DAP en UF, mensaje de Telegram mejorado y cola auto-reparable
+
+**Problemas detectados al completar DAPs por Telegram**
+- Los DAP en **UF** se registraban como pesos (`UF 4,4379` → `$44.379`) porque el parser eliminaba todo lo que no fuera dígito.
+- El mensaje mostraba la fecha como `Thu Apr 02 2026 00:00:00 GMT-0300 (...)`. Causa: en Apps Script los valores de fecha de `getValues()` vienen de otro contexto y `instanceof Date` da `false`. El mismo patrón estaba en `dap_cron.gs`, así que el cron diario **probablemente nunca liquidó ningún DAP**.
+- `_fetchWithRetry` logueaba la URL completa al fallar (habría filtrado la `apikey` de la CMF y ya filtraba el token del bot de Telegram).
+- Una fila en `ESPERANDO_TELEGRAM` cuyo caché expiraba (TTL 6 h) quedaba huérfana para siempre.
+
+**Cambios**
+- `config.gs` / `setup.gs`: 3 columnas nuevas al final de la hoja (`Moneda`, `Monto_Original`, `Valor_UF`); `installDapApp()` agrega los encabezados que falten sin tocar filas existentes.
+- `dap_parser.gs`: detecta moneda UF/CLP (por el prefijo del monto y el campo "Moneda"), parsea UF con coma decimal, y devuelve `Moneda`/`Monto_Original` (`Monto` = null en UF hasta convertir).
+- Nuevo `uf.gs`: `getUfValue(fecha)` (API CMF, requiere Script Property `CMF_API_KEY`, cacheado) y `_enrichWithClpAmount()` (monto CLP = UF × valor UF de la fecha de captación).
+- `dap_extractor.gs`: convierte UF antes de encolar (si falla, no encola ni etiqueta el hilo → reintento), arma la fila por nombre de columna y no duplica mensajes ya presentes.
+- `utils.gs`: `_isDateObject`, `_toIsoDate`, `_formatDateLong` (`Jueves 02/Abril/2026`), `_parseChileanNumber`, `_redactUrl`. Usados en `dap_queue.gs`, `dap_cron.gs` y `telegram.gs` en lugar de `instanceof Date` / `new Date(...)`.
+- `dap_queue.gs`: mensaje nuevo con N° de operación, fecha de captación y fechas legibles; para UF muestra `UF 4,4379 ≈ $X (UF del dd/mm/aaaa: $Y)`; retoma filas huérfanas en `ESPERANDO_TELEGRAM`.
+- `notion.gs`: `patchNotionPageProperties` genérico + `updateNotionDapAmount`.
+- `dap_maintenance.gs`: `releaseDapQueue()`, `repairUfDapAmounts()` (simulación) y `repairUfDapAmountsApply()`.
+- Tests (locales): 36 en total; nuevos para UF, utilidades de fecha (incluye fechas de otro contexto), cron y mensaje.
+
+**Pendiente (Fase B)**: variante RENOVABLE del mensaje (plazo de renovación y "Próxima ventana de renovación") y validación de la fecha tentativa contra las ventanas. Requiere un correo real de DAP renovable.
+
+**Pasos de despliegue**: guardar `CMF_API_KEY` en Propiedades del script (y regenerar la clave si se compartió en un chat) → importar código → `installDapApp()` → `auditPendingDapOperaciones()` → `repairUfDapAmounts()` (revisar log) → `repairUfDapAmountsApply()` → `releaseDapQueue()`.
+
 ## 2026-09-24 (2) — Bug real: ID_Operacion capturaba el N° de Transacción en vez del N° de Depósito
 
 **Cómo se detectó**: al revisar el DAP #13 (primero del backfill) en el Sheet, el `ID_Operacion` guardado (`31439026639`) no coincidía con ningún número real de la operación — el correo real tenía `N° Depósito: 071015510336` y, además, un campo nuevo `N° Transacción: W31439026639` que el parser no debía tocar.
