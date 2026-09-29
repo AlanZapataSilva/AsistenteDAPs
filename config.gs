@@ -46,6 +46,9 @@ const CONFIG = Object.freeze({
       'Valor_UF'
     ]
   },
+  // Feriados (fechas ISO 'yyyy-MM-dd') que se excluyen al contar los días hábiles de las
+  // ventanas de renovación. Opcional: por defecto solo se excluyen sábados y domingos.
+  HOLIDAYS: [],
   GMAIL: {
     // Etiqueta de idempotencia para marcar correos como procesados
     LABEL_DAP_PROCESSED: 'SaaS_Inversiones/DAP_Procesado'

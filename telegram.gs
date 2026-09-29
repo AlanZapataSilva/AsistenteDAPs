@@ -162,7 +162,7 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
     const tipoDap = dapRow[DAP_COLS.Tipo_DAP - 1];
     if (tipoDap === 'RENOVABLE') {
       cache.put(`${chatId}_DAP_STEP`, 'ESPERANDO_LIQUIDACION', 21600);
-      sendTelegramMessage(chatId, "🔄 Como es un DAP <b>RENOVABLE</b>, por favor indícame la Fecha Tentativa de Liquidación (Formato: YYYY-MM-DD).\n<i>Si no tienes fecha aún, responde 'saltar'.</i>");
+      sendTelegramMessage(chatId, _buildLiquidationPrompt(dapRow));
     } else {
       // DAP Fijo: Fecha de liquidación hereda el vencimiento
       const fechaVencimiento = _toIsoDate(dapRow[DAP_COLS.Fecha_Vencimiento - 1]);
@@ -171,10 +171,62 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
     }
 
   } else if (step === 'ESPERANDO_LIQUIDACION') {
-    const fechaLiq = text.toLowerCase() === 'saltar' ? "" : text;
-    sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaLiq);
+    if (text.toLowerCase() === 'saltar') {
+      sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue("");
+      finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
+      return;
+    }
+
+    const fechaIngresada = _parseUserDate(text);
+    if (!fechaIngresada) {
+      _keepConversationAlive(chatId, activeDapId, cache);
+      sendTelegramMessage(chatId, "⚠️ No entendí esa fecha. Usa el formato <code>YYYY-MM-DD</code> (ej. <code>2026-07-07</code>) o <code>DD-MM-YYYY</code>.\n<i>Si aún no tienes fecha, responde 'saltar'.</i>");
+      return;
+    }
+
+    // La fecha debe caer dentro de alguna ventana de renovación; si no, se propone la más cercana y se vuelve a preguntar
+    const renewal = _getRenewalInfo(dapRow);
+    const check = renewal ? _validateRenewalDate(fechaIngresada, renewal.fecha1, renewal.plazo) : { valid: true };
+    if (!check.valid) {
+      _keepConversationAlive(chatId, activeDapId, cache);
+      sendTelegramMessage(chatId,
+        `⚠️ La fecha <b>${_formatDateLong(fechaIngresada)}</b> no cae dentro de una ventana de renovación.\n` +
+        `La fecha válida más cercana es <b>${_formatDateLong(check.suggested)}</b> (ventana: ${_formatRenewalWindow(check.window)}).\n\n` +
+        `Ingresa nuevamente la fecha tentativa de liquidación, dentro de una ventana de renovación (o 'saltar').`);
+      return;
+    }
+
+    sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaIngresada);
     finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
   }
+}
+
+/**
+ * Mensaje que pide la fecha tentativa de liquidación de un DAP renovable, indicando la
+ * próxima ventana de renovación en la que puede liquidarse.
+ * @private
+ * @param {Array} dapRow - Fila del DAP en la hoja.
+ * @returns {string} Mensaje HTML de Telegram.
+ */
+function _buildLiquidationPrompt(dapRow) {
+  let msg = "🔄 Como es un DAP <b>RENOVABLE</b>, indícame la <b>fecha tentativa de liquidación</b> (formato YYYY-MM-DD).\n";
+  const renewal = _getRenewalInfo(dapRow);
+  if (renewal) {
+    const nextWindow = _nextRenewalWindow(renewal.fecha1, renewal.plazo, _todayIso());
+    msg += `La fecha debe estar dentro de una ventana de renovación (cada ${renewal.plazo} días). Próxima ventana: ${_formatRenewalWindow(nextWindow)}.\n`;
+  }
+  msg += "<i>Si no tienes fecha aún, responde 'saltar'.</i>";
+  return msg;
+}
+
+/**
+ * Renueva el TTL de la conversación activa (ACTIVE_DAP y DAP_STEP) cuando el usuario debe
+ * volver a responder, para que la sesión no expire en medio del reintento.
+ * @private
+ */
+function _keepConversationAlive(chatId, activeDapId, cache) {
+  cache.put(`${chatId}_ACTIVE_DAP`, String(activeDapId), 21600);
+  cache.put(`${chatId}_DAP_STEP`, 'ESPERANDO_LIQUIDACION', 21600);
 }
 
 /**

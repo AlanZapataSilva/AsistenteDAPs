@@ -79,9 +79,10 @@ function pingNextPendingDap() {
  * Arma el mensaje HTML de Telegram que presenta un DAP pendiente y pide su Objetivo.
  * @private
  * @param {Array} row - Fila completa de la hoja DAPs (valores de getValues).
+ * @param {string} [todayIso] - Fecha de hoy (ISO); por defecto la actual. Solo afecta a DAP renovables.
  * @returns {string} Mensaje en HTML de Telegram.
  */
-function _buildNewDapMessage(row) {
+function _buildNewDapMessage(row, todayIso) {
   const idInterno = row[DAP_COLS.ID_Interno - 1];
   const idOperacion = row[DAP_COLS.ID_Operacion - 1];
   const monto = row[DAP_COLS.Monto - 1];
@@ -105,7 +106,16 @@ function _buildNewDapMessage(row) {
   msg += `💰 <b>Monto:</b> ${montoStr}\n`;
   msg += `⚙️ <b>Tipo:</b> ${tipoDap}\n`;
   msg += `📅 <b>Fecha de captación:</b> ${_formatDateLong(fechaInicio)}\n`;
-  msg += `📅 <b>Fecha de vencimiento:</b> ${_formatDateLong(row[DAP_COLS.Fecha_Vencimiento - 1])}\n\n`;
+
+  const renewal = tipoDap === 'RENOVABLE' ? _getRenewalInfo(row) : null;
+  if (renewal) {
+    // Un DAP renovable no "vence": se renueva cada `plazo` días y se puede liquidar en la ventana de renovación
+    const nextWindow = _nextRenewalWindow(renewal.fecha1, renewal.plazo, todayIso || _todayIso());
+    msg += `🔄 <b>Plazo de renovación:</b> ${renewal.plazo} días\n`;
+    msg += `🗓️ <b>Próxima ventana de renovación:</b> ${_formatRenewalWindow(nextWindow)}\n\n`;
+  } else {
+    msg += `📅 <b>Fecha de vencimiento:</b> ${_formatDateLong(row[DAP_COLS.Fecha_Vencimiento - 1])}\n\n`;
+  }
   msg += `<i>Por favor, responde este mensaje indicando el <b>Objetivo</b> de este dinero (Ej: Vacaciones 2027, Fondo de Emergencia):</i>`;
   return msg;
 }

@@ -19,7 +19,13 @@
 - `dap_maintenance.gs`: `releaseDapQueue()`, `repairUfDapAmounts()` (simulación) y `repairUfDapAmountsApply()`.
 - Tests (locales): 36 en total; nuevos para UF, utilidades de fecha (incluye fechas de otro contexto), cron y mensaje.
 
-**Pendiente (Fase B)**: variante RENOVABLE del mensaje (plazo de renovación y "Próxima ventana de renovación") y validación de la fecha tentativa contra las ventanas. Requiere un correo real de DAP renovable.
+**Fase B — DAP renovables** (con un correo renovable real)
+- El correo renovable usa otra plantilla (3 celdas: etiqueta / `:` o `$` / valor; montos `1,525,000`). Se comprobó que el "gap" de un solo salto de línea de la entrada anterior fallaba en 2 de 4 layouts posibles de texto plano; ahora `_GAP` (`dap_parser.gs`) permite líneas intermedias que contengan solo separadores (`:`, `$`, `UF`, espacios) y sigue sin cruzar hacia otra etiqueta. `MONEDA` ahora es `Moneda[\s:]*(UF|Pesos)`.
+- Nuevo `renewal.gs`: ventanas de renovación `[Fecha1 + k·plazo, +2 días hábiles]` (lunes a viernes; feriados opcionales en `CONFIG.HOLIDAYS`), validación de fecha con sugerencia de la más cercana y `_parseUserDate`.
+- Mensaje de Telegram de un renovable: muestra "Plazo de renovación: N días" y "Próxima ventana de renovación: X al Y" en lugar de la fecha de vencimiento.
+- Paso `ESPERANDO_LIQUIDACION`: la fecha debe caer dentro de una ventana; si no, el bot propone la fecha válida más cercana y vuelve a preguntar hasta que sea válida (`saltar` sigue permitido; acepta `YYYY-MM-DD`, `DD-MM-YYYY`, `DD/MM/YYYY`).
+- `_parseFlexibleNumber` para montos en UF (formato de decimales distinto entre plantillas).
+- Tests: 80 en total.
 
 **Pasos de despliegue**: guardar `CMF_API_KEY` en Propiedades del script (y regenerar la clave si se compartió en un chat) → importar código → `installDapApp()` → `auditPendingDapOperaciones()` → `repairUfDapAmounts()` (revisar log) → `repairUfDapAmountsApply()` → `releaseDapQueue()`.
 

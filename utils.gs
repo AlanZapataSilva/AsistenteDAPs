@@ -115,3 +115,42 @@ function _formatDateLong(value) {
 function _parseChileanNumber(text) {
   return parseFloat(String(text).replace(/\./g, '').replace(',', '.'));
 }
+
+/**
+ * Convierte un número con separadores de miles/decimales en formato desconocido a Number.
+ * Reglas: si trae "." y ",", el último de los dos es el decimal; si trae un solo tipo de
+ * separador, es decimal cuando aparece una sola vez y NO va seguido de exactamente 3 dígitos
+ * ("4,4379" / "12.5" son decimales; "1,525" / "1.525.000" son miles).
+ * Se usa para montos en UF, cuyo formato varía entre plantillas de correo del banco.
+ * @private
+ * @param {string} text - Texto numérico.
+ * @returns {number} Valor numérico, o NaN si no se puede interpretar.
+ */
+function _parseFlexibleNumber(text) {
+  const t = String(text).trim();
+  const lastDot = t.lastIndexOf('.');
+  const lastComma = t.lastIndexOf(',');
+  let decimalIndex = -1;
+
+  if (lastDot >= 0 && lastComma >= 0) {
+    decimalIndex = Math.max(lastDot, lastComma);
+  } else if (lastDot >= 0 || lastComma >= 0) {
+    const index = Math.max(lastDot, lastComma);
+    const separator = t.charAt(index);
+    const occurrences = t.split(separator).length - 1;
+    const digitsAfter = t.length - index - 1;
+    if (occurrences === 1 && digitsAfter !== 3) decimalIndex = index;
+  }
+
+  if (decimalIndex < 0) return parseFloat(t.replace(/[.,]/g, ''));
+  const integerPart = t.slice(0, decimalIndex).replace(/[.,]/g, '');
+  return parseFloat(`${integerPart}.${t.slice(decimalIndex + 1)}`);
+}
+
+/**
+ * @private
+ * @returns {string} Fecha de hoy (yyyy-MM-dd) en la zona horaria del script.
+ */
+function _todayIso() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}

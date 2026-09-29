@@ -17,31 +17,34 @@
  * @property {string} Fecha_Vencimiento - Fecha de maduración en formato YYYY-MM-DD.
  */
 
+// "Gap" entre una etiqueta y su valor. Reglas (ver AGENTS.md, "Email Regex Line-Crossing"):
+//  - Tolera que la etiqueta y el valor estén en la misma línea o en líneas distintas (Gmail suele
+//    renderizar cada celda de una tabla HTML en su propia línea), incluyendo plantillas de 3
+//    celdas etiqueta / separador (":" , "$" o "UF") / valor.
+//  - Solo puede saltar: el resto de la línea de la etiqueta y líneas que contengan ÚNICAMENTE
+//    separadores (espacios, ":", "$", "UF") o estén en blanco. Nunca cruza hacia otra fila con
+//    texto (otra etiqueta), que es lo que causó capturar el N° de Transacción en vez del de Depósito.
+//  - Es un texto para `new RegExp` y no lleva grupos de captura.
+const _GAP = '(?:[^\\d\\r\\n]*\\r?\\n)?(?:[ \\t\\u00a0:$]*(?:UF)?[ \\t\\u00a0:$]*\\r?\\n)*[^\\d\\r\\n]*';
+
 /**
  * Constantes y Expresiones Regulares para el Banco BCI.
  * @constant {Object}
  */
 const DAP_BCI_LOGIC = Object.freeze({
   SUBJECT: 'Comprobante Solicitud de Toma Depósito a plazo',
-  // Nota sobre "[^\d]" vs "(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*": el primero (usado abajo solo en
-  // TIPO, donde es intencional) cruza cualquier cantidad de saltos de línea sin límite. El
-  // segundo —usado en MONTO, FECHA_INICIO y FECHA_VENCIMIENTO— permite cruzar COMO MÁXIMO
-  // un salto de línea entre la etiqueta y el valor (mismo fix aplicado a OPERACION_CANDIDATES
-  // más abajo, ver su comentario). Sin este límite, un fallback genérico (ej. "Monto" o
-  // "Capital" sueltos) podría matchear en un lugar inesperado del correo y, al no haber techo
-  // de saltos de línea, terminar capturando un número de una fila completamente distinta de
-  // la tabla en vez de fallar limpiamente o encontrar el valor correcto.
   REGEX: {
-    // Atrapa "Monto Inversión", saltando posibles caracteres de codificación (=C3=B3).
-    // Grupo 1: prefijo entre la etiqueta y el número (ej. "$ " o "UF "), usado para detectar
-    // la moneda. Grupo 2: el número (CLP: "61.000"; UF: "4,4379").
-    MONTO: /(?:Monto Inversi.*n|Monto|Capital)(?:[^\d\r\n]*\r?\n)?([^\d\r\n]*)([\d.,]+)/i,
+    // Atrapa "Monto Inversión". Grupo 1: todo el gap entre la etiqueta y el número (puede
+    // contener "$" o "UF", usado para detectar la moneda). Grupo 2: el número (CLP: "61.000" o
+    // "1,525,000"; UF: "4,4379").
+    MONTO: new RegExp('(?:Monto Inversi.*n|Monto|Capital)(' + _GAP + ')([\\d.,]+)', 'i'),
     // Campo "Moneda" de la tabla (valor "UF" o "Pesos"); señal adicional a la del prefijo del monto
-    MONEDA: /Moneda(?:[^\r\n]*\r?\n)?[^A-Za-z\r\n]*(UF|Pesos)\b/i,
-    // Atrapa "Tipo de Documento" y busca la palabra "Fijo" o "Renovable"
+    MONEDA: /Moneda[\s:]*(UF|Pesos)\b/i,
+    // Atrapa "Tipo de Documento" y busca la palabra "Fijo" o "Renovable" (cruza líneas a propósito,
+    // de forma perezosa: se queda con la primera aparición)
     TIPO: /(?:Tipo de Documento|Tipo de Dep.sito|Tipo)[\s\S]*?(Fijo|Renovable)/i,
-    FECHA_INICIO: /(?:Fecha de Captaci.*n|Fecha de Toma|Fecha Inicio|Emisi.n)(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*([\d/-]{10})/i,
-    FECHA_VENCIMIENTO: /(?:Fecha de Vencimiento|Vencimiento)(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*([\d/-]{10})/i
+    FECHA_INICIO: new RegExp('(?:Fecha de Captaci.*n|Fecha de Toma|Fecha Inicio|Emisi.n)' + _GAP + '([\\d/-]{10})', 'i'),
+    FECHA_VENCIMIENTO: new RegExp('(?:Fecha de Vencimiento|Vencimiento)' + _GAP + '([\\d/-]{10})', 'i')
   },
   // Candidatos para el N° de Depósito/Operación, ordenados por confiabilidad (más
   // específico primero). Se usa el PRIMERO que matchee en cualquier parte del correo,
@@ -52,17 +55,12 @@ const DAP_BCI_LOGIC = Object.freeze({
   // palabra en el encabezado (que aparece antes en el texto).
   // "(?:del\s+)?" hace opcional la palabra "del" porque BCI la agregó/quitó entre versiones
   // de la plantilla ("N° del Depósito" vs "N° Depósito").
-  // El "gap" entre la etiqueta y el número permite cruzar COMO MÁXIMO un salto de línea
-  // (label y value en líneas separadas, como suele renderizar Gmail una tabla HTML), pero
-  // no más allá — así nunca se cuela a una fila distinta de la tabla ni al valor de otro
-  // campo, que es justo lo que causaba el bug real (capturar el N° de Transacción en vez
-  // del N° de Depósito).
   OPERACION_CANDIDATES: [
-    /N.*(?:del\s+)?Dep.*sito(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*(\d{6,15})/i,
-    /Comprobante(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*(\d{6,15})/i,
-    /N.mero(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*(\d{6,15})/i,
-    /Nro(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*(\d{6,15})/i,
-    /Operaci.n(?:[^\d\r\n]*\r?\n)?[^\d\r\n]*(\d{6,15})/i
+    new RegExp('N.*(?:del\\s+)?Dep.*sito' + _GAP + '(\\d{6,15})', 'i'),
+    new RegExp('Comprobante' + _GAP + '(\\d{6,15})', 'i'),
+    new RegExp('N.mero' + _GAP + '(\\d{6,15})', 'i'),
+    new RegExp('Nro' + _GAP + '(\\d{6,15})', 'i'),
+    new RegExp('Operaci.n' + _GAP + '(\\d{6,15})', 'i')
   ]
 });
 
@@ -109,7 +107,7 @@ function parseBciDapEmail(message) {
     const esUF = /\bUF\b/i.test(matchMonto[1]) || (matchMoneda !== null && /^UF$/i.test(matchMoneda[1]));
     const moneda = esUF ? 'UF' : 'CLP';
     const montoOriginal = esUF
-      ? _parseChileanNumber(matchMonto[2])
+      ? _parseFlexibleNumber(matchMonto[2])
       : parseInt(matchMonto[2].replace(/[^\d]/g, ''), 10);
     const tipoLimpio = matchTipo ? matchTipo[1].trim().toUpperCase() : 'FIJO';
     const messageDate = message.getDate();
