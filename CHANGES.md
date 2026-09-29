@@ -1,5 +1,18 @@
 # Registro de cambios
 
+## 2026-09-30 — Formato antiguo en mensajes por webhook, moneda original y auditoría
+
+**Síntoma**: tras reanudar la cola, solo el primer mensaje salió con el formato nuevo; los siguientes con el antiguo (fecha `Mon Aug 03 2026 00:00:00 GMT-0400...`, sin N° de operación ni captación).
+
+**Auditoría del código**: el texto antiguo no existe en el repo; el aviso se construye solo en `_buildNewDapMessage()` y se envía solo desde `pingNextPendingDap()`; no hay `.gs` duplicados. **Causa**: el webhook de Telegram (`doPost`) ejecuta la *versión desplegada* del Web App (antigua), mientras que `releaseDapQueue()` (ejecutado desde el editor) usa el código más reciente. **Solución**: crear una nueva versión de la implementación Web App tras cada importación (ver AGENTS.md, "Deployment Versions").
+
+**Cambios**
+- `dap_queue.gs`: el mensaje incluye "Moneda original" (Pesos chilenos (CLP) o UF convertida a pesos; `Moneda` vacía = CLP). El monto sigue mostrándose siempre en pesos.
+- `config.gs` / `telegram.gs`: `APP_VERSION` y comando `/version` para verificar qué código corre el webhook.
+- `notion.gs`: `_listAllNotionPages` (paginado) y `_groupNotionDuplicates`.
+- `dap_maintenance.gs`: `auditCompletedDaps()` (solo lectura): duplicados en Notion, renovables con fecha de liquidación fuera de ventana y completados sin página de Notion — para revisar lo completado con el código antiguo.
+- Tests: 88 en total.
+
 ## 2026-09-29 — DAP en UF, mensaje de Telegram mejorado y cola auto-reparable
 
 **Problemas detectados al completar DAPs por Telegram**

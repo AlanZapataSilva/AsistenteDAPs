@@ -97,6 +97,12 @@ function doPost(e) {
       return ACK;
     }
     
+    // Comando /version: permite comprobar qué versión del código ejecuta el Web App desplegado
+    if (text.toLowerCase() === '/version') {
+      sendTelegramMessage(chatId, `🧩 Versión del código en ejecución: <code>${APP_VERSION}</code>`);
+      return ACK;
+    }
+
     // Comando Manual de Liquidación
     if (text.toLowerCase().startsWith('/liquidar')) {
       const parts = text.split(' ');

@@ -16,6 +16,14 @@ function getEnv(key) {
 }
 
 /**
+ * Sello de versión del código. Súbelo en cada entrega: el comando `/version` del bot lo
+ * devuelve para comprobar qué versión está ejecutando el Web App (el webhook corre la versión
+ * DESPLEGADA, no el código más reciente del editor).
+ * @constant {string}
+ */
+const APP_VERSION = '2026-09-30.1';
+
+/**
  * Constantes estructurales del sistema.
  * Implementa Object.freeze para garantizar la inmutabilidad de la configuración 
  * durante el ciclo de vida de la ejecución.

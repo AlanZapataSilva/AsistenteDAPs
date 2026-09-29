@@ -104,6 +104,7 @@ function _buildNewDapMessage(row, todayIso) {
   msg += `🆔 <b>${idInterno}</b>\n`;
   msg += `🔢 <b>N° operación:</b> ${idOperacion}\n`;
   msg += `💰 <b>Monto:</b> ${montoStr}\n`;
+  msg += `💱 <b>Moneda original:</b> ${moneda === 'UF' ? 'UF (convertida a pesos)' : 'Pesos chilenos (CLP)'}\n`;
   msg += `⚙️ <b>Tipo:</b> ${tipoDap}\n`;
   msg += `📅 <b>Fecha de captación:</b> ${_formatDateLong(fechaInicio)}\n`;
 

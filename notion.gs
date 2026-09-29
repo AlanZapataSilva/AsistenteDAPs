@@ -78,6 +78,63 @@ function _readNotionProperty(page, propName, type) {
 }
 
 /**
+ * Lista todas las páginas de la base de datos de Notion (paginado de a 100).
+ * @private
+ * @param {string} token - Token de integración de Notion.
+ * @param {string} dbId - ID de la base de datos de Notion.
+ * @returns {Object[]|null} Páginas (id + properties), o null si alguna consulta falla.
+ */
+function _listAllNotionPages(token, dbId) {
+  const url = `https://api.notion.com/v1/databases/${dbId}/query`;
+  const pages = [];
+  let cursor = null;
+
+  for (let i = 0; i < 100; i++) {
+    const payload = { page_size: 100 };
+    if (cursor) payload.start_cursor = cursor;
+
+    const res = _fetchWithRetry(url, {
+      method: 'post',
+      headers: _getNotionHeaders(token),
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    if (!res || res.getResponseCode() !== 200) return null;
+
+    const json = JSON.parse(res.getContentText());
+    pages.push(...(json.results || []));
+    if (!json.has_more) return pages;
+    cursor = json.next_cursor;
+  }
+
+  return pages;
+}
+
+/**
+ * Agrupa páginas de Notion por "ID operación" y devuelve solo los grupos con más de una página
+ * (posibles duplicados).
+ * @private
+ * @param {Object[]} pages - Páginas de Notion (id + properties).
+ * @returns {{idOperacion: number, pages: {id: string, objetivo: string|null}[]}[]} Grupos duplicados.
+ */
+function _groupNotionDuplicates(pages) {
+  const groups = {};
+
+  pages.forEach((page) => {
+    const idOperacion = _readNotionProperty(page, 'ID operación', 'number');
+    if (idOperacion === null) return;
+    (groups[idOperacion] = groups[idOperacion] || []).push({
+      id: page.id,
+      objetivo: _readNotionProperty(page, 'Objetivo', 'title')
+    });
+  });
+
+  return Object.keys(groups)
+    .filter((key) => groups[key].length > 1)
+    .map((key) => ({ idOperacion: Number(key), pages: groups[key] }));
+}
+
+/**
  * Crea (o complementa, si ya existe por "ID operación") un registro de DAP en Notion.
  * Evita duplicados: si ya existe una página con el mismo número de operación (por ejemplo,
  * al reprocesar correos históricos con `backfillDapEmails()`), no crea una página nueva, sino
