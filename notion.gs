@@ -111,30 +111,6 @@ function _listAllNotionPages(token, dbId) {
 }
 
 /**
- * Agrupa páginas de Notion por "ID operación" y devuelve solo los grupos con más de una página
- * (posibles duplicados).
- * @private
- * @param {Object[]} pages - Páginas de Notion (id + properties).
- * @returns {{idOperacion: number, pages: {id: string, objetivo: string|null}[]}[]} Grupos duplicados.
- */
-function _groupNotionDuplicates(pages) {
-  const groups = {};
-
-  pages.forEach((page) => {
-    const idOperacion = _readNotionProperty(page, 'ID operación', 'number');
-    if (idOperacion === null) return;
-    (groups[idOperacion] = groups[idOperacion] || []).push({
-      id: page.id,
-      objetivo: _readNotionProperty(page, 'Objetivo', 'title')
-    });
-  });
-
-  return Object.keys(groups)
-    .filter((key) => groups[key].length > 1)
-    .map((key) => ({ idOperacion: Number(key), pages: groups[key] }));
-}
-
-/**
  * Crea (o complementa, si ya existe por "ID operación") un registro de DAP en Notion.
  * Evita duplicados: si ya existe una página con el mismo número de operación (por ejemplo,
  * al reprocesar correos históricos con `backfillDapEmails()`), no crea una página nueva, sino
@@ -327,4 +303,128 @@ function patchNotionPageProperties(pageId, properties) {
     console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);
     return false;
   }
+}
+/**
+ * Construye el DTO que se envía a Notion a partir de una fila de la hoja DAPs.
+ * @private
+ * @param {Array} row - Fila de la hoja (valores de getValues).
+ * @returns {Object} DTO con fechas ISO (`Fecha_Liquidacion` es null si está vacía).
+ */
+function _buildDapDtoFromRow(row) {
+  return {
+    ID_Interno: row[DAP_COLS.ID_Interno - 1],
+    ID_Operacion: row[DAP_COLS.ID_Operacion - 1],
+    Monto: row[DAP_COLS.Monto - 1],
+    Tipo_DAP: row[DAP_COLS.Tipo_DAP - 1],
+    Fecha_Inicio: _toIsoDate(row[DAP_COLS.Fecha_Inicio - 1]),
+    Fecha_Vencimiento: _toIsoDate(row[DAP_COLS.Fecha_Vencimiento - 1]),
+    Objetivo: row[DAP_COLS.Objetivo - 1],
+    Fecha_Liquidacion: _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]) || null,
+    Liquidado: row[DAP_COLS.Liquidado - 1]
+  };
+}
+
+/**
+ * Archiva una página de Notion (queda en la papelera de Notion y es restaurable desde ahí;
+ * no se borra de forma permanente).
+ * @param {string} pageId - El ID único de la página en Notion.
+ * @returns {boolean} true si se archivó, false si falló.
+ */
+function archiveNotionPage(pageId) {
+  const token = getEnv('NOTION_API_TOKEN');
+  if (!token || !pageId) {
+    console.error('❌ Notion API: Falta Token o Page ID para archivar la página.');
+    return false;
+  }
+
+  const res = _fetchWithRetry(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: 'patch',
+    headers: _getNotionHeaders(token),
+    payload: JSON.stringify({ archived: true }),
+    muteHttpExceptions: true
+  });
+  if (!res) return false;
+
+  if (res.getResponseCode() === 200) {
+    console.info(`🗄️ Notion: página [${pageId}] archivada.`);
+    return true;
+  }
+  console.error(`❌ Error Notion API (archivar): Código ${res.getResponseCode()} - ${res.getContentText()}`);
+  return false;
+}
+
+/**
+ * Convierte una página de Notion a un DTO con los mismos nombres de campo que usa el Sheet.
+ * Los campos vacíos quedan en null.
+ * @private
+ * @param {Object} page - Página de Notion (id + properties).
+ * @returns {Object} DTO de la página.
+ */
+function _notionPageToDap(page) {
+  const objetivo = _readNotionProperty(page, 'Objetivo', 'title');
+  return {
+    Objetivo: (objetivo && objetivo !== 'Sin Objetivo') ? objetivo : null,
+    Monto: _readNotionProperty(page, 'Monto', 'number'),
+    Tipo_DAP: _readNotionProperty(page, 'Tipo DAP', 'select'),
+    Fecha_Inicio: _readNotionProperty(page, 'Fecha inicio', 'date'),
+    Fecha_Vencimiento: _readNotionProperty(page, 'Fecha vencimiento', 'date'),
+    Fecha_Liquidacion: _readNotionProperty(page, 'Fecha liquidación', 'date'),
+    Liquidado: _readNotionProperty(page, 'Liquidado', 'checkbox') === true
+  };
+}
+
+/**
+ * Planifica la deduplicación de páginas de Notion por "ID operación". Por cada grupo con más de
+ * una página: se conserva la MÁS RECIENTE (`created_time`), y de las antiguas se toma solo la
+ * información que a la conservada le falte (`merged`, en orden de la más nueva a la más vieja).
+ * Un grupo se marca con `skipReason` (y no debe archivarse automáticamente) si las páginas
+ * traen valores DISTINTOS de Monto, tipo o fechas de inicio/vencimiento, porque entonces
+ * probablemente no son el mismo DAP. Diferencias solo de Objetivo se informan en `conflicts`
+ * pero no bloquean (se conserva el Objetivo de la más reciente).
+ * @private
+ * @param {Object[]} pages - Páginas de Notion (id, created_time, properties).
+ * @returns {{idOperacion: number, survivor: Object, olds: Object[], merged: Object, conflicts: string[], skipReason: string|null}[]}
+ */
+function _planNotionDedupe(pages) {
+  const groups = {};
+  pages.forEach((page) => {
+    const idOperacion = _readNotionProperty(page, 'ID operación', 'number');
+    if (idOperacion === null) return;
+    (groups[idOperacion] = groups[idOperacion] || []).push(page);
+  });
+
+  const hasValue = (v) => v !== null && v !== undefined && v !== '';
+
+  return Object.keys(groups)
+    .filter((key) => groups[key].length > 1)
+    .map((key) => {
+      const sorted = groups[key].slice().sort((a, b) => String(b.created_time || '').localeCompare(String(a.created_time || '')));
+      const survivor = sorted[0];
+      const olds = sorted.slice(1);
+      const survivorDap = _notionPageToDap(survivor);
+      const merged = { ID_Operacion: key };
+      const conflicts = [];
+      let skipReason = null;
+
+      olds.forEach((old) => {
+        const oldDap = _notionPageToDap(old);
+
+        ['Monto', 'Tipo_DAP', 'Fecha_Inicio', 'Fecha_Vencimiento'].forEach((field) => {
+          if (hasValue(survivorDap[field]) && hasValue(oldDap[field]) && survivorDap[field] !== oldDap[field]) {
+            skipReason = skipReason || `${field} distinto entre páginas (${survivorDap[field]} vs ${oldDap[field]})`;
+          }
+        });
+
+        if (hasValue(survivorDap.Objetivo) && hasValue(oldDap.Objetivo) && survivorDap.Objetivo !== oldDap.Objetivo) {
+          conflicts.push(`Objetivo "${oldDap.Objetivo}" se descarta; se conserva "${survivorDap.Objetivo}"`);
+        }
+
+        ['Objetivo', 'Monto', 'Tipo_DAP', 'Fecha_Inicio', 'Fecha_Vencimiento', 'Fecha_Liquidacion'].forEach((field) => {
+          if (!hasValue(merged[field]) && hasValue(oldDap[field])) merged[field] = oldDap[field];
+        });
+        if (oldDap.Liquidado) merged.Liquidado = true;
+      });
+
+      return { idOperacion: Number(key), survivor: survivor, olds: olds, merged: merged, conflicts: conflicts, skipReason: skipReason };
+    });
 }

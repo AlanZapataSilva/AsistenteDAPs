@@ -249,17 +249,7 @@ function finalizeDap(chatId, activeDapId, rowIndex, sheet, cache) {
   const data = sheet.getDataRange().getValues();
   const row = data[rowIndex - 1]; 
   
-  const dapDto = {
-    ID_Interno: row[DAP_COLS.ID_Interno - 1],
-    ID_Operacion: row[DAP_COLS.ID_Operacion - 1],
-    Monto: row[DAP_COLS.Monto - 1],
-    Tipo_DAP: row[DAP_COLS.Tipo_DAP - 1],
-    Fecha_Inicio: _toIsoDate(row[DAP_COLS.Fecha_Inicio - 1]),
-    Fecha_Vencimiento: _toIsoDate(row[DAP_COLS.Fecha_Vencimiento - 1]),
-    Objetivo: row[DAP_COLS.Objetivo - 1],
-    Fecha_Liquidacion: _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]) || null,
-    Liquidado: row[DAP_COLS.Liquidado - 1]
-  };
+  const dapDto = _buildDapDtoFromRow(row);
 
   const notionPageId = pushDapToNotion(dapDto);
 

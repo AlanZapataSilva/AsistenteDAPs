@@ -1,5 +1,16 @@
 # Registro de cambios
 
+## 2026-09-30 (2) — Auditoría y reparación completa de Sheet + Notion
+
+`auditCompletedDaps()` pasa a ser la **simulación** de un pipeline completo (solo log) y `repairCompletedDapsApply()` lo aplica (nuevo `dap_repair.gs`). Orden obligatorio:
+1. **Sheet a)** marca como liquidados los DAP cuya fecha de liquidación ya pasó (o que Notion ya marca liquidados).
+2. **Sheet b)** DAP renovables sin liquidar con fecha tentativa fuera de ventana: se informan con 🚨 y se corrige la fecha a la válida más cercana (se interpretó "tipo fijo" del pedido como **renovable**, único tipo que tiene ventanas).
+3. **Sheet c)** COMPLETADOS sin página en Notion: se envían (upsert por ID operación, así no se duplican) con la fecha ya corregida.
+4. **Notion a)** duplicados por ID operación: se conserva la página más reciente (`created_time`), se complementa con lo que tenían las antiguas (solo campos vacíos y Liquidado false→true), se archivan las antiguas (restaurables desde la papelera de Notion), se re-enlazan las filas del Sheet que apuntaban a páginas archivadas y se reflejan en Notion los cambios de los pasos 1 y 2.
+
+Salvaguardas: simulación por defecto; los grupos con Monto, tipo o fechas distintos se omiten (`⛔`) para revisión manual, y los conflictos de Objetivo se registran (`↔️`) antes de descartar el antiguo. Se reemplazó la auditoría de solo lectura anterior.
+Cambios de apoyo: `_buildDapDtoFromRow`, `archiveNotionPage`, `_notionPageToDap`, `_planNotionDedupe` (notion.gs), `_planSheetFixes` (dap_repair.gs). Tests: 91.
+
 ## 2026-09-30 — Formato antiguo en mensajes por webhook, moneda original y auditoría
 
 **Síntoma**: tras reanudar la cola, solo el primer mensaje salió con el formato nuevo; los siguientes con el antiguo (fecha `Mon Aug 03 2026 00:00:00 GMT-0400...`, sin N° de operación ni captación).

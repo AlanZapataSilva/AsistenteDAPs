@@ -21,7 +21,7 @@ function getEnv(key) {
  * DESPLEGADA, no el código más reciente del editor).
  * @constant {string}
  */
-const APP_VERSION = '2026-09-30.1';
+const APP_VERSION = '2026-09-30.2';
 
 /**
  * Constantes estructurales del sistema.
