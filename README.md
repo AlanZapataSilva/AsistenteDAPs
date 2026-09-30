@@ -14,6 +14,7 @@ Gmail (BCI) → parser estricto → Google Sheets → cola FIFO → Telegram ↔
 - **Pregunta** por Telegram, de a un DAP a la vez, el objetivo del dinero (y, en los renovables, una fecha de liquidación dentro de una ventana de renovación).
 - **Sincroniza** con Notion sin duplicar (upsert por número de operación) y reintenta solo si Notion falla.
 - **Liquida** automáticamente los DAP vencidos y avisa.
+- **Lee los correos de liquidación** del banco (`contacto@bci.cl`, "Comprobante de liquidación de Depósito a plazo"): marca el DAP como liquidado en Sheet y Notion con la fecha real y guarda su **monto final** (para analizar ganancias). Los DAP fijos además registran una proyección del monto final desde el correo de toma; `reprocessFinalAmounts()` completa el historial.
 - **Se vigila a sí mismo**: alertas por Telegram, `healthCheck` diario, canario semanal del parser y respaldo semanal del Sheet.
 
 ## Puesta en marcha

@@ -356,6 +356,18 @@ function _parseFlexibleNumber(text) {
 }
 
 /**
+ * Interpreta una celda numérica opcional: vacía o no numérica es `null` (nunca 0).
+ * @private
+ * @param {*} value - Valor de la celda.
+ * @returns {number|null} Número finito, o null.
+ */
+function _numberOrNull(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+/**
  * @private
  * @returns {string} Fecha de hoy (yyyy-MM-dd) en la zona horaria del script.
  */

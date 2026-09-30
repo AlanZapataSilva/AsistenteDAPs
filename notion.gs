@@ -86,7 +86,7 @@ function _readNotionProperty(page, propName, type) {
  * Construye el DTO que se envía a Notion a partir de una fila de la hoja DAPs.
  * @private
  * @param {Array} row - Fila de la hoja (valores de getValues).
- * @returns {Object} DTO con fechas ISO (`Fecha_Liquidacion` es null si está vacía).
+ * @returns {Object} DTO con fechas ISO (`Fecha_Liquidacion` es null si está vacía; `Monto_Final` es null si aún no se conoce).
  */
 function _buildDapDtoFromRow(row) {
   return {
@@ -98,7 +98,8 @@ function _buildDapDtoFromRow(row) {
     Fecha_Vencimiento: _toIsoDate(row[DAP_COLS.Fecha_Vencimiento - 1]),
     Objetivo: row[DAP_COLS.Objetivo - 1],
     Fecha_Liquidacion: _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]) || null,
-    Liquidado: _isChecked(row[DAP_COLS.Liquidado - 1])
+    Liquidado: _isChecked(row[DAP_COLS.Liquidado - 1]),
+    Monto_Final: _numberOrNull(row[DAP_COLS.Monto_Final - 1])
   };
 }
 
@@ -159,9 +160,12 @@ function _createNotionPage(token, dbId, dap) {
     }
   };
 
-  // Agregar la fecha de liquidación solo si existe para no enviar campos vacíos
+  // Agregar la fecha de liquidación y el monto final solo si existen para no enviar campos vacíos
   if (dap.Fecha_Liquidacion) {
     payload.properties[P.FECHA_LIQUIDACION] = { date: { start: dap.Fecha_Liquidacion } };
+  }
+  if (Number.isFinite(dap.Monto_Final)) {
+    payload.properties[P.MONTO_FINAL] = { number: dap.Monto_Final };
   }
 
   const res = _fetchWithRetry('https://api.notion.com/v1/pages', {
@@ -215,6 +219,10 @@ function _complementExistingNotionPage(token, existingPage, dap) {
     patchProps[P.MONTO] = { number: dap.Monto };
   }
 
+  if (Number.isFinite(dap.Monto_Final) && _readNotionProperty(existingPage, P.MONTO_FINAL, 'number') === null) {
+    patchProps[P.MONTO_FINAL] = { number: dap.Monto_Final };
+  }
+
   if (dap.Tipo_DAP && !_readNotionProperty(existingPage, P.TIPO, 'select')) {
     patchProps[P.TIPO] = { select: { name: dap.Tipo_DAP } };
   }
@@ -252,6 +260,62 @@ function updateNotionDapStatus(pageId) {
 }
 
 /**
+ * Lee una página de Notion por su ID.
+ * @private
+ * @param {string} token - Token de integración de Notion.
+ * @param {string} pageId - ID de la página.
+ * @returns {Object|null} Página (id + properties), o null si no existe o la consulta falla.
+ */
+function _getNotionPage(token, pageId) {
+  const res = _fetchWithRetry(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: 'get',
+    headers: _getNotionHeaders(token),
+    muteHttpExceptions: true
+  });
+  if (!res || res.getResponseCode() !== 200) return null;
+  return JSON.parse(res.getContentText());
+}
+
+/**
+ * Completa "Monto final" en la página de un DAP solo si está vacío (nunca pisa un valor existente,
+ * que puede ser el real de una liquidación o uno escrito a mano).
+ * @param {string} pageId - ID de la página del DAP en Notion.
+ * @param {number} montoFinal - Monto final proyectado, en CLP.
+ * @returns {boolean} true si Notion quedó con un monto final (el existente o el nuevo); false si falló.
+ */
+function fillNotionMontoFinal(pageId, montoFinal) {
+  const token = getEnv('NOTION_API_TOKEN');
+  if (!token || !pageId) {
+    console.error('❌ Notion API: Falta Token o Page ID para completar el monto final.');
+    return false;
+  }
+
+  const page = _getNotionPage(token, pageId);
+  if (!page) return false;
+  if (_readNotionProperty(page, CONFIG.NOTION.PROPS.MONTO_FINAL, 'number') !== null) return true;
+  return patchNotionPageProperties(pageId, { [CONFIG.NOTION.PROPS.MONTO_FINAL]: { number: montoFinal } });
+}
+
+/**
+ * Registra en Notion la liquidación real de un DAP: marca "Liquidado", fija la fecha real de
+ * liquidación y el monto final. A diferencia de `pushDapToNotion` (que solo completa campos vacíos)
+ * SOBRESCRIBE la fecha y el monto: el correo del banco es la fuente definitiva y reemplaza a la
+ * fecha tentativa y a la proyección del monto.
+ * @param {string} pageId - ID de la página del DAP en Notion.
+ * @param {{Fecha_Liquidacion: string, Monto_Final: number}} liquidation - Fecha ISO real y monto final en CLP.
+ * @returns {boolean} true si Notion quedó actualizado.
+ */
+function applyLiquidationToNotion(pageId, liquidation) {
+  const P = CONFIG.NOTION.PROPS;
+  const properties = {
+    [P.LIQUIDADO]: { checkbox: true },
+    [P.FECHA_LIQUIDACION]: { date: { start: liquidation.Fecha_Liquidacion } }
+  };
+  if (Number.isFinite(liquidation.Monto_Final)) properties[P.MONTO_FINAL] = { number: liquidation.Monto_Final };
+  return patchNotionPageProperties(pageId, properties);
+}
+
+/**
  * Aplica un PATCH a las propiedades indicadas de una página de Notion (solo esas se modifican).
  * @param {string} pageId - El ID único de la página en Notion.
  * @param {Object} properties - Propiedades a mutar, en el formato de la API de Notion.
@@ -281,6 +345,40 @@ function patchNotionPageProperties(pageId, properties) {
 
   console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);
   return false;
+}
+
+/**
+ * Crea en la base de datos de Notion las propiedades que este código agregó y que aún no existan
+ * ("Monto final", numérica, con el mismo formato que "Monto"). Es idempotente y nunca modifica una
+ * propiedad ya existente (si tiene otro tipo, `_validateNotionSchema` lo informa). Es un intento
+ * "de mejor esfuerzo": si la integración no tiene permiso para editar la base, hay que crearla a mano.
+ * @param {string} token - Token de integración de Notion.
+ * @param {string} dbId - ID de la base de datos de Notion.
+ * @returns {{ok: boolean, created: string[], message: string}} `ok` es false si no se pudo consultar o crear;
+ *   `created` lista las propiedades creadas.
+ */
+function _ensureNotionProperties(token, dbId) {
+  const url = `https://api.notion.com/v1/databases/${dbId}`;
+  const read = _fetchWithRetry(url, { method: 'get', headers: _getNotionHeaders(token), muteHttpExceptions: true });
+  if (!read || read.getResponseCode() !== 200) {
+    return { ok: false, created: [], message: 'No se pudo leer la base de datos de Notion.' };
+  }
+
+  const properties = (JSON.parse(read.getContentText()).properties) || {};
+  const P = CONFIG.NOTION.PROPS;
+  if (properties[P.MONTO_FINAL]) return { ok: true, created: [], message: 'La base de datos ya tiene todas las propiedades.' };
+
+  const montoFormat = properties[P.MONTO] && properties[P.MONTO].number && properties[P.MONTO].number.format;
+  const write = _fetchWithRetry(url, {
+    method: 'patch',
+    headers: _getNotionHeaders(token),
+    payload: JSON.stringify({ properties: { [P.MONTO_FINAL]: { number: { format: montoFormat || 'number' } } } }),
+    muteHttpExceptions: true
+  });
+  if (!write || write.getResponseCode() !== 200) {
+    return { ok: false, created: [], message: `Notion no permitió crear la propiedad "${P.MONTO_FINAL}" (código ${write ? write.getResponseCode() : 'sin respuesta'}).` };
+  }
+  return { ok: true, created: [P.MONTO_FINAL], message: `Propiedad "${P.MONTO_FINAL}" creada.` };
 }
 
 /**

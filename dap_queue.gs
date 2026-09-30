@@ -143,14 +143,23 @@ function _buildNewDapMessage(row, todayIso) {
   msg += `⚙️ <b>Tipo:</b> ${_escapeHtml(tipoDap)}\n`;
   msg += `📅 <b>Fecha de captación:</b> ${_formatDateLong(fechaInicio)}\n`;
 
-  const renewal = tipoDap === 'RENOVABLE' ? _getRenewalInfo(row) : null;
+  // Si el correo de liquidación llegó antes que tu respuesta, el DAP ya está liquidado: no tiene sentido proponer ventanas
+  const liquidated = _isChecked(row[DAP_COLS.Liquidado - 1]);
+  const renewal = tipoDap === 'RENOVABLE' && !liquidated ? _getRenewalInfo(row) : null;
   if (renewal) {
     // Un DAP renovable no "vence": se renueva cada `plazo` días y se puede liquidar en la ventana de renovación
     const nextWindow = _nextRenewalWindow(renewal.fecha1, renewal.plazo, todayIso || _todayIso());
     msg += `🔄 <b>Plazo de renovación:</b> ${renewal.plazo} días\n`;
     msg += `🗓️ <b>Próxima ventana de renovación:</b> ${_formatRenewalWindow(nextWindow)}\n\n`;
   } else {
-    msg += `📅 <b>Fecha de vencimiento:</b> ${_formatDateLong(row[DAP_COLS.Fecha_Vencimiento - 1])}\n\n`;
+    msg += `📅 <b>Fecha de vencimiento:</b> ${_formatDateLong(row[DAP_COLS.Fecha_Vencimiento - 1])}\n`;
+    if (liquidated) {
+      const montoFinal = _numberOrNull(row[DAP_COLS.Monto_Final - 1]);
+      msg += `✅ <b>Ya liquidado</b> el ${_formatDateLong(row[DAP_COLS.Fecha_Liquidacion - 1])}`;
+      if (montoFinal !== null) msg += ` — monto final $${new Intl.NumberFormat('es-CL').format(montoFinal)}`;
+      msg += `\n`;
+    }
+    msg += `\n`;
   }
 
   msg += `<i>Por favor, responde este mensaje indicando el <b>Objetivo</b> de este dinero (Ej: Vacaciones 2027, Fondo de Emergencia):</i>`;

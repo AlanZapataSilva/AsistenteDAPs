@@ -1,5 +1,25 @@
 # Registro de cambios
 
+## 2026-10-02 — Correos de liquidación y monto final de los DAP (versión 2026-10-02.1)
+
+**Problema**: muchos DAP liquidados (sobre todo renovables) no figuraban como liquidados: el sistema solo leía el correo de toma y el cron marcaba por la fecha tentativa; el correo "Comprobante de liquidación de Depósito a plazo" no se monitoreaba. Además no quedaba registrado el monto final de ningún DAP.
+
+**Correos de liquidación** (nuevo `dap_liquidation.gs`, trigger `processDapLiquidationEmails` cada 30 min)
+- Busca correos de `contacto@bci.cl` con ese asunto (remitente validado por dirección exacta, `CONFIG.BANKS.BCI.LIQUIDATION_SENDERS`), extrae el N° del depósito, el monto final y la fecha real (`parseBciLiquidationEmailDetailed`, parser estricto y sin fallbacks genéricos para el N°) y marca el DAP como liquidado: **Notion primero, Sheet después** (si Notion falla se reintenta a los 30 min). La fecha real reemplaza a la tentativa.
+- Idempotente por mensaje (`ID_Mensaje_Liquidacion`) y por DAP (`Origen_Monto_Final`); no depende de la etiqueta del hilo (Gmail puede unir correos de igual asunto en un hilo ya etiquetado). Un N° de depósito sin DAP registrado → `DAP_Error` + una alerta agrupada. Aviso por Telegram con monto invertido, monto final y ganancia.
+- Un DAP que aún está en la cola de Telegram conserva su estado; al responder no se le pregunta la fecha ni se pisa la real (`handleDapConversation`), y el aviso indica que ya está liquidado.
+- DAP en UF: el monto final en pesos se convierte con la UF de la fecha de liquidación (sin valor de la UF → se reintenta); un DAP en UF pagado en pesos deriva la UF equivalente.
+
+**Monto final para todos los DAP** (nuevo `dap_final_amount.gs`)
+- 5 columnas nuevas al final del Sheet: `Monto_Final` (CLP), `Monto_Final_Original` (moneda del DAP), `Valor_UF_Final`, `Origen_Monto_Final` (`CAPTACION` | `LIQUIDACION`) e `ID_Mensaje_Liquidacion`; propiedad `Monto final` (número) en Notion, que `installDapApp()` crea si falta.
+- DAP **fijos**: el parser del correo de toma lee el "Valor Final" (opcional; se descarta si es incoherente) y se guarda como proyección (`CAPTACION`). DAP **renovables**: solo el correo de liquidación da el monto final (el "Valor Final" del correo de toma es el del primer período). El monto real reemplaza siempre a la proyección.
+
+**Reprocesamiento del historial** (nuevo `dap_reprocess.gs`): `reprocessFinalAmounts()` (simulación) y `reprocessFinalAmountsApply()` — fase 1: correos de liquidación de los últimos N meses; fase 2: proyección de los fijos que aún no tienen monto final. Idempotente, con presupuesto de tiempo, y lista los renovables liquidados sin correo de liquidación.
+
+**Otros**: `parserCanary()` también re-parsea los correos de liquidación; `healthCheck` exige la propiedad `Monto final` en Notion; `_parseBankAmount`, `_readEmailBody`, `_numberOrNull`, `_senderAddress` como utilidades compartidas.
+
+**Pasos de despliegue**: importar → `installDapApp()` (columnas, trigger y propiedad de Notion) → nueva versión del Web App → `/version` → `healthCheck()` → `reprocessFinalAmounts()`, revisar el log y `reprocessFinalAmountsApply()`. Tests: 356 (fixtures de la plantilla real de liquidación en `tests/parser.test.js`; flujo en `tests/liquidation.test.js` y `tests/reprocess.test.js`).
+
 ## 2026-10-01 — Auditoría de producción (versión 2026-10-01.1)
 
 Auditoría completa del código y puesta en producción. Detalle de hallazgos, correcciones y verificaciones pendientes en `AUDITORIA.md`; evolución en `HOJA_DE_RUTA.md`. Etiqueta de rollback: `pre-produccion` (commit `eecce51`).

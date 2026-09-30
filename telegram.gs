@@ -244,6 +244,9 @@ function _setConversationStep(sheet, rowIndex, step) {
  */
 function handleDapConversation(chatId, text, sheet, rowIndex, dapRow) {
   const step = _getConversationStep(dapRow);
+  // Un DAP en la cola solo puede estar Liquidado si su correo de liquidación llegó antes de que
+  // respondieras: ya tiene la fecha real, así que no se pregunta ni se pisa (ver dap_liquidation.gs)
+  const alreadyLiquidated = _isChecked(dapRow[DAP_COLS.Liquidado - 1]);
 
   if (step === CONFIG.STEPS.OBJETIVO) {
     const objetivo = _validateObjetivo(text);
@@ -254,7 +257,9 @@ function handleDapConversation(chatId, text, sheet, rowIndex, dapRow) {
 
     _setPlainText(sheet, rowIndex, DAP_COLS.Objetivo, objetivo.value);
 
-    if (dapRow[DAP_COLS.Tipo_DAP - 1] === 'RENOVABLE') {
+    if (alreadyLiquidated) {
+      finalizeDap(chatId, sheet, rowIndex);
+    } else if (dapRow[DAP_COLS.Tipo_DAP - 1] === 'RENOVABLE') {
       _setConversationStep(sheet, rowIndex, CONFIG.STEPS.LIQUIDACION);
       sendTelegramMessage(chatId, _buildLiquidationPrompt(dapRow));
     } else {
@@ -266,6 +271,12 @@ function handleDapConversation(chatId, text, sheet, rowIndex, dapRow) {
   }
 
   if (step === CONFIG.STEPS.LIQUIDACION) {
+    if (alreadyLiquidated) {
+      sendTelegramMessage(chatId, "ℹ️ Este DAP ya fue liquidado (según el correo del banco): no necesito la fecha tentativa.");
+      finalizeDap(chatId, sheet, rowIndex);
+      return;
+    }
+
     if (text.toLowerCase() === 'saltar') {
       sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue("");
       finalizeDap(chatId, sheet, rowIndex);

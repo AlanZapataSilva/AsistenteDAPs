@@ -62,13 +62,23 @@ function _buildDapSearchQuery(timeWindow) {
  * @returns {boolean} true si el dominio es uno de `CONFIG.BANKS.BCI.SENDER_DOMAINS` (o un subdominio).
  */
 function _isAllowedSender(fromHeader) {
-  const angle = String(fromHeader || '').match(/<([^>]+)>/);
-  const address = (angle ? angle[1] : String(fromHeader || '')).trim().toLowerCase();
+  const address = _senderAddress(fromHeader);
   const at = address.lastIndexOf('@');
   if (at < 0) return false;
 
   const domain = address.slice(at + 1);
   return CONFIG.BANKS.BCI.SENDER_DOMAINS.some((allowed) => domain === allowed || domain.endsWith(`.${allowed}`));
+}
+
+/**
+ * Dirección de correo (en minúsculas) de un encabezado `From`.
+ * @private
+ * @param {string} fromHeader - Valor de `GmailMessage.getFrom()` (ej. `BCI <avisos@bci.cl>`).
+ * @returns {string} Dirección sin nombre visible, o cadena vacía.
+ */
+function _senderAddress(fromHeader) {
+  const angle = String(fromHeader || '').match(/<([^>]+)>/);
+  return (angle ? angle[1] : String(fromHeader || '')).trim().toLowerCase();
 }
 
 /**
@@ -244,6 +254,8 @@ function _processThread(thread, sheet, ctx, summary) {
       Avisos_Enviados: 0,
       Notion_Intentos: 0
     };
+    // Monto final proyectado (solo DAP fijos con "Valor Final" en el correo de toma); si no hay, las columnas quedan vacías
+    Object.assign(valores, _finalColumnValues(_captureFinalAmounts(dapDto), CONFIG.FINAL_SOURCES.CAPTACION, ''));
     sheet.appendRow(CONFIG.HEADERS.DAPS.map((header) => valores[header]));
     ctx.existingIds.add(messageId);
     ctx.existingOps.add(operationId);

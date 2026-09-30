@@ -198,7 +198,12 @@ function parserCanary() {
   try {
     const sheet = _openDapSheet();
     const rowsByMessage = {};
-    sheet.getDataRange().getValues().slice(1).forEach((row) => { rowsByMessage[String(row[DAP_COLS.ID_Mensaje_Email - 1])] = row; });
+    const rowsByLiquidationMessage = {};
+    sheet.getDataRange().getValues().slice(1).forEach((row) => {
+      rowsByMessage[String(row[DAP_COLS.ID_Mensaje_Email - 1])] = row;
+      const liquidationMessageId = String(row[DAP_COLS.ID_Mensaje_Liquidacion - 1] || '');
+      if (liquidationMessageId) rowsByLiquidationMessage[liquidationMessageId] = row;
+    });
 
     const threads = GmailApp.search(_buildDapSearchQuery('newer_than:60d').replace(/-label:\S+/g, '').trim(), 0, 20);
     let total = 0;
@@ -231,6 +236,26 @@ function parserCanary() {
       if (stored.tipo !== dto.Tipo_DAP) mismatches.push(`DAP [${id}] Tipo_DAP`);
       if (stored.inicio !== dto.Fecha_Inicio) mismatches.push(`DAP [${id}] Fecha_Inicio`);
       if (stored.vencimiento !== dto.Fecha_Vencimiento) mismatches.push(`DAP [${id}] Fecha_Vencimiento`);
+    }));
+
+    // Plantilla del correo de liquidación: misma vigilancia (se detecta un cambio antes de que se pierdan liquidaciones)
+    const liquidationQuery = _buildDapLiquidationSearchQuery('newer_than:60d').replace(/-label:\S+/g, '').trim();
+    GmailApp.search(liquidationQuery, 0, 20).forEach((thread) => thread.getMessages().forEach((msg) => {
+      if (!_isAllowedLiquidationSender(msg.getFrom())) return;
+      total++;
+
+      const parsed = parseBciLiquidationEmailDetailed(msg);
+      if (!parsed.ok) {
+        failures.push(`${parsed.error.code} — liquidación "${_truncate(msg.getSubject(), 50)}"`);
+        return;
+      }
+
+      const row = rowsByLiquidationMessage[msg.getId()];
+      if (!row) return;
+      const id = row[DAP_COLS.ID_Interno - 1];
+      const storedAmount = _numberOrNull(row[DAP_COLS.Monto_Final_Original - 1]);
+      if (_normalizeOperationId(row[DAP_COLS.ID_Operacion - 1]) !== _normalizeOperationId(parsed.dto.ID_Operacion)) mismatches.push(`DAP [${id}] liquidación ID_Operacion`);
+      if (storedAmount === null || Math.abs(storedAmount - parsed.dto.Monto_Final_Original) > 0.00005) mismatches.push(`DAP [${id}] liquidación Monto_Final_Original`);
     }));
 
     console.info(`🐤 Canario del parser: ${total} correo(s) revisado(s), ${failures.length} sin interpretar, ${mismatches.length} diferencia(s).`);
