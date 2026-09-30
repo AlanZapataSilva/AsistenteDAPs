@@ -1,17 +1,18 @@
 # Hoja de ruta — evolución de AsistenteDAPs
 
-Ideas priorizadas por **valor** (V) y **esfuerzo** (E), de 1 (bajo) a 3 (alto). Nada de esto está implementado: es el registro de deuda técnica y de evolución (revisar cada trimestre, ver `AUDITORIA.md`).
+Ideas priorizadas por **valor** (V) y **esfuerzo** (E), de 1 (bajo) a 3 (alto). Es el registro de deuda técnica y de evolución (revisar cada trimestre, ver `AUDITORIA.md`); lo ya implementado se indica en la fila correspondiente.
 
 ## 1. Con los productos actuales (DAP en CLP y UF, fijos y renovables)
 
 | Idea | V | E | Detalle |
 |---|---|---|---|
 | Alertas de vencimiento y de ventana | 3 | 1 | Avisar 7/3/1 día antes del vencimiento de un DAP fijo y al abrirse cada ventana de renovación (los datos ya están: `renewal.gs`). Nuevo trigger diario. |
-| Confirmar la liquidación de renovables | 3 | 2 | Hoy el cron marca `Liquidado` por la fecha *tentativa*. Preguntar por Telegram con botones (Sí / No, sigue renovándose) y registrar la respuesta. |
+| Confirmar la liquidación de renovables | 3 | 1 | **Parcial:** el correo de liquidación del banco ya marca `Liquidado` con la fecha y el monto reales (`dap_liquidation.gs`). Pendiente: el cron diario sigue marcando renovables por la fecha *tentativa* (falso positivo si el DAP se renovó). Dejar que solo el correo (o una confirmación por Telegram con botones Sí / No, sigue renovándose) marque los renovables; `reprocessFinalAmounts()` ya lista los renovables marcados sin correo de liquidación. |
 | Eventos en Google Calendar | 2 | 1 | Crear un evento por vencimiento/ventana (`CalendarApp`, un scope más) con recordatorios. |
 | `/resumen` y `/proximos` | 3 | 2 | Capital por moneda, tasa ponderada, vencimientos del mes y flujo mensual esperado. Comandos nuevos en `_routeMessage`. |
-| Extraer Tasa, Ganancia y Valor Final | 3 | 1 | El correo los trae y hoy se descartan. Con ellos: TEA real, "recibirás $X el DD", proyección de flujo de caja. Requiere columnas nuevas y ampliar el parser + fixtures. |
-| Leer correos de renovación y pago | 3 | 2 | Cerrar el ciclo de forma automática en vez de depender de la fecha tentativa (nueva plantilla → nuevo fixture). |
+| Extraer Tasa, Ganancia y Valor Final | 3 | 1 | **Parcial:** "Valor Final" ya se lee (proyección del monto final de los DAP fijos, columnas `Monto_Final*`). Pendiente Tasa y Ganancia del correo de toma: TEA real, "recibirás $X el DD", proyección de flujo de caja. Requiere columnas nuevas y ampliar el parser + fixtures. |
+| Leer correos de renovación y pago | 3 | 2 | **Parcial:** el correo de *liquidación* ya se lee (monto final real). Pendiente el correo de *renovación* (nueva plantilla → nuevo fixture) para registrar cada renovación de un DAP renovable y su monto intermedio. |
+| Análisis de ganancias | 3 | 2 | Con `Monto` y `Monto_Final` (y `Fecha_Inicio` / `Fecha_Liquidacion` reales) calcular ganancia, rentabilidad y tasa anualizada por DAP y por Objetivo (`/resumen`, rollups de Notion). Para DAP en UF usar `Monto_Original` y `Monto_Final_Original` (ganancia real en UF, sin el efecto de la variación de la UF). |
 | Metas por Objetivo | 2 | 2 | Monto objetivo por meta y progreso; vistas/rollups de Notion por Objetivo. |
 | Botones en Telegram | 2 | 2 | Teclados en línea para `/liquidar`, confirmaciones y "saltar" (menos errores de tipeo). Comandos `/cancelar` y `/descartar` para falsos positivos. |
 | Consultas en lenguaje natural | 2 | 3 | "¿Cuánto vence en noviembre?" resuelto con Gemini/Claude sobre el Sheet (solo lectura, con esquema fijo). |

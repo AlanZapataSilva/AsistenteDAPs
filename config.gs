@@ -22,7 +22,7 @@ function getEnv(key) {
  * App desplegado.
  * @constant {string}
  */
-const APP_VERSION = '2026-10-01.1';
+const APP_VERSION = '2026-10-02.1';
 
 /**
  * Constantes estructurales del sistema.
@@ -57,8 +57,21 @@ const CONFIG = Object.freeze({
       'Paso_Conversacion',
       'Ultimo_Aviso',
       'Avisos_Enviados',
-      'Notion_Intentos'
+      'Notion_Intentos',
+      // Monto final del depósito (ver dap_final_amount.gs). Estas 5 columnas deben quedar contiguas
+      // y en este orden: se escriben con un solo setValues (FINAL_COLUMNS).
+      'Monto_Final',
+      'Monto_Final_Original',
+      'Valor_UF_Final',
+      'Origen_Monto_Final',
+      'ID_Mensaje_Liquidacion'
     ]
+  },
+  // Origen del monto final (columna Origen_Monto_Final): CAPTACION = proyección leída del correo de
+  // toma (solo DAP fijos); LIQUIDACION = monto real del correo de liquidación (definitivo).
+  FINAL_SOURCES: {
+    CAPTACION: 'CAPTACION',
+    LIQUIDACION: 'LIQUIDACION'
   },
   // Estados de la cola (columna Estado_Cola). Flujo normal:
   // PENDIENTE_OBJETIVO -> ESPERANDO_TELEGRAM -> COMPLETADO
@@ -103,7 +116,8 @@ const CONFIG = Object.freeze({
       FECHA_INICIO: 'Fecha inicio',
       FECHA_VENCIMIENTO: 'Fecha vencimiento',
       FECHA_LIQUIDACION: 'Fecha liquidación',
-      LIQUIDADO: 'Liquidado'
+      LIQUIDADO: 'Liquidado',
+      MONTO_FINAL: 'Monto final'
     },
     PROP_TYPES: {
       'Objetivo': 'title',
@@ -113,13 +127,17 @@ const CONFIG = Object.freeze({
       'Fecha inicio': 'date',
       'Fecha vencimiento': 'date',
       'Fecha liquidación': 'date',
-      'Liquidado': 'checkbox'
+      'Liquidado': 'checkbox',
+      'Monto final': 'number'
     }
   },
   BANKS: {
     BCI: {
       // Solo se aceptan correos cuyo remitente pertenezca a estos dominios (o subdominios)
-      SENDER_DOMAINS: ['bci.cl']
+      SENDER_DOMAINS: ['bci.cl'],
+      // Los correos de liquidación se aceptan solo de estas direcciones exactas (más estricto que
+      // el dominio: un comprobante falso marcaría un DAP como liquidado con un monto inventado)
+      LIQUIDATION_SENDERS: ['contacto@bci.cl']
     }
   },
   // Feriados (fechas ISO 'yyyy-MM-dd') que se excluyen al contar los días hábiles de las

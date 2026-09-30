@@ -17,6 +17,7 @@
 /** @type {TriggerSpec[]} */
 const _TRIGGER_SPECS = [
   { handler: 'processDapEmails', description: 'cada 15 min', create: (b) => b.timeBased().everyMinutes(15).create() },
+  { handler: 'processDapLiquidationEmails', description: 'cada 30 min', create: (b) => b.timeBased().everyMinutes(30).create() },
   { handler: 'checkAndLiquidateDaps', description: 'diario 08:00', create: (b) => b.timeBased().everyDays(1).atHour(8).create() },
   { handler: 'retryNotionSync', description: 'cada 30 min', create: (b) => b.timeBased().everyMinutes(30).create() },
   { handler: 'watchdogTick', description: 'cada hora', create: (b) => b.timeBased().everyHours(1).create() },
@@ -44,6 +45,7 @@ function installDapApp() {
 
     // Delegación de responsabilidades a funciones privadas
     _setupDatabase(ss);
+    _setupNotion();
     _setupGmailLabels();
     _setupTriggers();
 
@@ -136,11 +138,13 @@ function _applySheetPolish(sheet) {
   dropdown('Estado_Cola', Object.keys(CONFIG.STATES).map((key) => CONFIG.STATES[key]));
   dropdown('Tipo_DAP', ['FIJO', 'RENOVABLE']);
   dropdown('Moneda', ['CLP', 'UF']);
+  dropdown('Origen_Monto_Final', Object.keys(CONFIG.FINAL_SOURCES).map((key) => CONFIG.FINAL_SOURCES[key]));
 
   column('Liquidado').insertCheckboxes();
   column('ID_Operacion').setNumberFormat('0');
   ['Fecha_Inicio', 'Fecha_Vencimiento', 'Fecha_Liquidacion'].forEach((name) => column(name).setNumberFormat('yyyy-mm-dd'));
   column('Objetivo').setNumberFormat('@');
+  column('ID_Mensaje_Liquidacion').setNumberFormat('@');
 
   const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
   if (!protections.some((p) => p.getDescription() === 'DAP_HEADER')) {
@@ -148,6 +152,31 @@ function _applySheetPolish(sheet) {
   }
 
   console.log('✅ Validaciones y formatos de la hoja aplicados.');
+}
+
+/**
+ * Asegura que la base de datos de Notion tenga las propiedades que usa el código (hoy solo crea
+ * "Monto final"). Es de mejor esfuerzo: si Notion no lo permite, avisa cómo crearla a mano y la
+ * instalación continúa (`healthCheck` seguirá informando la propiedad faltante).
+ * @private
+ * @returns {void}
+ */
+function _setupNotion() {
+  const token = getEnv('NOTION_API_TOKEN');
+  const dbId = getEnv('NOTION_DAP_DATABASE_ID');
+  if (!token || !dbId) {
+    console.warn('⚠️ Notion: faltan NOTION_API_TOKEN o NOTION_DAP_DATABASE_ID; no se verificaron las propiedades.');
+    return;
+  }
+
+  try {
+    const result = _ensureNotionProperties(token, dbId);
+    if (result.created.length > 0) console.log(`✅ Notion: propiedad(es) creada(s): ${result.created.join(', ')}.`);
+    else if (result.ok) console.log('ℹ️ Notion: la base de datos ya tiene todas las propiedades.');
+    else console.warn(`⚠️ Notion: ${result.message} Crea a mano la propiedad "${CONFIG.NOTION.PROPS.MONTO_FINAL}" (tipo Número) en la base de datos.`);
+  } catch (error) {
+    console.warn(`⚠️ Notion: no se pudieron verificar las propiedades: ${error.message}`);
+  }
 }
 
 /**
