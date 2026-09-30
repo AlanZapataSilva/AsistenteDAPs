@@ -1,77 +1,112 @@
 /**
  * @fileoverview dap_queue.gs - Gestor de la cola de procesamiento.
+ * Cola FIFO de un solo DAP activo a la vez. El estado vive en el Sheet (no en el caché):
+ *   PENDIENTE_OBJETIVO -> ESPERANDO_TELEGRAM (Paso_Conversacion) -> COMPLETADO | PENDIENTE_NOTION
  */
 
 'use strict';
 
 /**
- * Lee la base de datos buscando el primer DAP pendiente y notifica al usuario por Telegram.
- * Implementa un patrón "First In, First Out" (FIFO) procesando un elemento a la vez.
+ * Avanza la cola: si ya hay una conversación activa (fila ESPERANDO_TELEGRAM) reenvía la pregunta
+ * cuando lleva demasiado tiempo sin respuesta; si no la hay, avisa por Telegram del primer DAP
+ * pendiente. Es segura de llamar en cualquier momento (extractor, cierre de conversación,
+ * watchdog): opera bajo el lock de script y nunca lanza excepciones.
+ * @returns {void}
  */
 function pingNextPendingDap() {
-  const spreadsheetId = getEnv('SHARED_SPREADSHEET_ID');
-  const chatId = getEnv('TELEGRAM_CHAT_ID');
-  
-  if (!spreadsheetId || !chatId) {
-    console.error('❌ Cola: Faltan credenciales de entorno (Spreadsheet o Chat ID).');
-    return;
-  }
-
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) {
-    console.warn('⚠️ Cola ocupada: No se pudo obtener el Lock. Se reintentará luego.');
-    return;
-  }
-
   try {
-    // Evitamos pisar una conversación FSM en curso: si ya hay un DAP activo en
-    // caché, no debemos avanzar la cola (dejaría esa fila huérfana en
-    // ESPERANDO_TELEGRAM para siempre, ya que el caché perdería su referencia).
-    const cache = CacheService.getScriptCache();
-    if (cache.get(`${chatId}_ACTIVE_DAP`)) {
-      console.info('ℹ️ Cola: Ya existe una conversación DAP activa en caché. Se pospone el avance de la cola.');
-      return;
-    }
-
-    const ss = SpreadsheetApp.openById(spreadsheetId);
-    const sheet = ss.getSheetByName(CONFIG.SHEETS.DAPS);
-    const data = sheet.getDataRange().getValues();
-
-    // Iteramos desde la fila 2 (saltando los encabezados)
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      const estadoCola = row[DAP_COLS.Estado_Cola - 1];
-
-      // Llegados aquí no hay conversación activa en caché (ver guard arriba), por lo que una fila
-      // en ESPERANDO_TELEGRAM es huérfana (ej. su sesión expiró por TTL) y se vuelve a preguntar.
-      if (estadoCola === 'PENDIENTE_OBJETIVO' || estadoCola === 'ESPERANDO_TELEGRAM') {
-        const idInterno = row[DAP_COLS.ID_Interno - 1];
-
-        // 1. Prevención de Concurrencia: Mutamos el estado en Sheets inmediatamente
-        const rowIndex = i + 1;
-        sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue('ESPERANDO_TELEGRAM');
-        SpreadsheetApp.flush();
-        
-        // 2. Preparación de la Máquina de Estados (FSM) en Caché
-        const TTL_SECONDS = 21600; // 6 horas de validez de la sesión
-        
-        // Forzamos String() para evitar fallos de Type Coercion al comparar más adelante
-        cache.put(`${chatId}_ACTIVE_DAP`, String(idInterno), TTL_SECONDS); 
-        cache.put(`${chatId}_DAP_STEP`, 'ESPERANDO_OBJETIVO', TTL_SECONDS);
-        
-        // 3. Construcción y envío del mensaje (delegamos el envío a telegram.gs, DRY)
-        sendTelegramMessage(chatId, _buildNewDapMessage(row));
-        
-        console.info(`✅ Cola: Notificación enviada para DAP [${idInterno}]. FSM a la espera de respuesta.`);
-        
-        // Rompemos el bucle: Solo procesamos UNO a la vez para no saturar al usuario
-        break; 
-      }
-    }
+    const result = _withScriptLock(() => _advanceQueue(), 10000);
+    if (!result.acquired) console.warn('⚠️ Cola ocupada: No se pudo obtener el Lock. Se reintentará luego.');
   } catch (error) {
     console.error(`❌ Error crítico en pingNextPendingDap: ${error.stack || error.message}`);
-  } finally {
-    lock.releaseLock();
+    _alertAdmin('QUEUE_ERROR', `Fallo al avanzar la cola: <code>${_escapeHtml(error.message)}</code>`);
+  }
+}
+
+/**
+ * Lógica de `pingNextPendingDap` (debe ejecutarse bajo el lock de script).
+ * @private
+ * @returns {void}
+ */
+function _advanceQueue() {
+  const chatId = getEnv('TELEGRAM_CHAT_ID');
+  if (!chatId) {
+    console.error('❌ Cola: Falta TELEGRAM_CHAT_ID en las propiedades.');
+    return;
+  }
+
+  const sheet = _openDapSheet();
+  const data = sheet.getDataRange().getValues();
+
+  // 1. Si hay una conversación activa no se avanza (un DAP a la vez); solo se recuerda si se estancó.
+  const active = _findActiveConversation(data);
+  if (active) {
+    _remindIfStale(chatId, sheet, active);
+    return;
+  }
+
+  // 2. Sin conversación activa: activar el primer DAP pendiente (FIFO)
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (row[DAP_COLS.Estado_Cola - 1] !== CONFIG.STATES.PENDIENTE_OBJETIVO) continue;
+
+    const rowIndex = i + 1;
+    const idInterno = row[DAP_COLS.ID_Interno - 1];
+
+    // Prevención de concurrencia: el estado se muta en Sheets ANTES de avisar
+    sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue(CONFIG.STATES.ESPERANDO_TELEGRAM);
+    sheet.getRange(rowIndex, DAP_COLS.Paso_Conversacion).setValue(CONFIG.STEPS.OBJETIVO);
+    sheet.getRange(rowIndex, DAP_COLS.Ultimo_Aviso).setValue(new Date().toISOString());
+    sheet.getRange(rowIndex, DAP_COLS.Avisos_Enviados).setValue(1);
+    SpreadsheetApp.flush();
+
+    if (sendTelegramMessage(chatId, _buildNewDapMessage(row))) {
+      console.info(`✅ Cola: Notificación enviada para DAP [${idInterno}]. Esperando respuesta.`);
+    } else {
+      // Si el aviso no se entregó, el DAP vuelve a la cola (el watchdog lo reintentará)
+      sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue(CONFIG.STATES.PENDIENTE_OBJETIVO);
+      sheet.getRange(rowIndex, DAP_COLS.Paso_Conversacion).setValue('');
+      sheet.getRange(rowIndex, DAP_COLS.Avisos_Enviados).setValue(0);
+      SpreadsheetApp.flush();
+      console.error(`❌ Cola: No se pudo enviar el aviso del DAP [${idInterno}]; vuelve a PENDIENTE_OBJETIVO.`);
+      _alertAdmin('QUEUE_SEND', `No se pudo enviar por Telegram el aviso del DAP ${_escapeHtml(idInterno)}. Reintentaré en la próxima revisión.`);
+    }
+
+    // Solo se avisa de UN DAP a la vez para no saturar al usuario
+    return;
+  }
+}
+
+/**
+ * Reenvía la pregunta pendiente si la conversación activa lleva más de
+ * `CONFIG.FSM.REMINDER_HOURS` sin respuesta (máximo `CONFIG.FSM.MAX_REMINDERS` recordatorios;
+ * después alerta al administrador). Una fila sin `Ultimo_Aviso` (anterior a esta columna) se
+ * considera estancada y se reenvía de inmediato.
+ * @private
+ * @param {string} chatId - ID del chat autorizado.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de DAPs.
+ * @param {{rowIndex: number, row: Array}} active - Conversación activa.
+ * @returns {void}
+ */
+function _remindIfStale(chatId, sheet, active) {
+  const row = active.row;
+  const idInterno = row[DAP_COLS.ID_Interno - 1];
+  const lastMs = _toEpochMs(row[DAP_COLS.Ultimo_Aviso - 1]);
+  const sent = Number(row[DAP_COLS.Avisos_Enviados - 1]) || 0;
+
+  if (lastMs && Date.now() - lastMs < CONFIG.FSM.REMINDER_HOURS * 3600000) return;
+
+  if (sent > CONFIG.FSM.MAX_REMINDERS) {
+    _alertAdmin(`FSM_STALE_${idInterno}`, `El DAP ${_escapeHtml(idInterno)} lleva mucho tiempo sin respuesta en Telegram (${sent} avisos).`);
+    return;
+  }
+
+  const step = _getConversationStep(row);
+  const question = step === CONFIG.STEPS.LIQUIDACION ? _buildLiquidationPrompt(row) : _buildNewDapMessage(row);
+  if (sendTelegramMessage(chatId, `⏰ <b>Recordatorio: DAP pendiente de respuesta</b>\n\n${question}`)) {
+    sheet.getRange(active.rowIndex, DAP_COLS.Ultimo_Aviso).setValue(new Date().toISOString());
+    sheet.getRange(active.rowIndex, DAP_COLS.Avisos_Enviados).setValue(sent + 1);
+    console.info(`⏰ Cola: Recordatorio ${sent} enviado para el DAP [${idInterno}].`);
   }
 }
 
@@ -101,11 +136,11 @@ function _buildNewDapMessage(row, todayIso) {
   }
 
   let msg = `🔔 <b>¡Nuevo Depósito a Plazo Detectado!</b>\n\n`;
-  msg += `🆔 <b>${idInterno}</b>\n`;
-  msg += `🔢 <b>N° operación:</b> ${idOperacion}\n`;
+  msg += `🆔 <b>${_escapeHtml(idInterno)}</b>\n`;
+  msg += `🔢 <b>N° operación:</b> ${_escapeHtml(idOperacion)}\n`;
   msg += `💰 <b>Monto:</b> ${montoStr}\n`;
   msg += `💱 <b>Moneda original:</b> ${moneda === 'UF' ? 'UF (convertida a pesos)' : 'Pesos chilenos (CLP)'}\n`;
-  msg += `⚙️ <b>Tipo:</b> ${tipoDap}\n`;
+  msg += `⚙️ <b>Tipo:</b> ${_escapeHtml(tipoDap)}\n`;
   msg += `📅 <b>Fecha de captación:</b> ${_formatDateLong(fechaInicio)}\n`;
 
   const renewal = tipoDap === 'RENOVABLE' ? _getRenewalInfo(row) : null;
@@ -117,6 +152,7 @@ function _buildNewDapMessage(row, todayIso) {
   } else {
     msg += `📅 <b>Fecha de vencimiento:</b> ${_formatDateLong(row[DAP_COLS.Fecha_Vencimiento - 1])}\n\n`;
   }
+
   msg += `<i>Por favor, responde este mensaje indicando el <b>Objetivo</b> de este dinero (Ej: Vacaciones 2027, Fondo de Emergencia):</i>`;
   return msg;
 }

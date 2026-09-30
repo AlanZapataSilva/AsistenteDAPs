@@ -2,69 +2,74 @@
 
 ## Overview & Architecture
 
-Google Apps Script (GAS) microservice on V8 runtime (`America/Santiago` timezone) managing Term Deposits (DAPs) across Gmail (BCI), Google Sheets, Telegram Bot, and Notion API.
+Google Apps Script (GAS) microservice on V8 runtime (`America/Santiago` timezone) managing Term Deposits (DAPs, fixed and renewable, CLP and UF) across Gmail (BCI), Google Sheets, Telegram Bot, and Notion API.
 
-Data Pipeline:
-`dap_extractor.gs` (Gmail BCI scraper) -> `dap_parser.gs` (Regex DTO parser) -> Google Sheets (`DAPs` sheet) -> `dap_queue.gs` (FIFO queue) -> Telegram Webhook (`telegram.gs` FSM) -> Notion API (`notion.gs`) -> Daily liquidation cron (`dap_cron.gs`).
+Data pipeline:
+`dap_extractor.gs` (Gmail BCI scraper) -> `dap_parser.gs` (strict regex parser) -> Google Sheets (`DAPs` sheet, durable state) -> `dap_queue.gs` (FIFO queue, one active DAP) -> Telegram webhook (`telegram.gs` FSM) -> Notion API (`notion.gs`) -> daily liquidation (`dap_cron.gs`).
+Support: `config.gs` (constants), `utils.gs` (network, text, dates, locks, alerts, sheet access), `uf.gs` (UF value), `renewal.gs` (renewal windows), `setup.gs` (installation), `dap_ops.gs` (operations), `dap_health.gs` (health check, parser canary), `dap_archive.gs` (archived one-off code, **fully commented**).
 
-## Trigger Entrypoints & Functions
+Audit and roadmap: `AUDITORIA.md` (findings register + continuous improvement), `HOJA_DE_RUTA.md` (evolution). Change log: `CHANGES.md`.
 
-- **Infrastructure Setup**: `installDapApp()` (`setup.gs`) — Prepares Sheet headers, Gmail label, and time-driven triggers (`processDapEmails`, `checkAndLiquidateDaps`) via `_setupTriggers()`. Idempotent; run manually once (safe to re-run after redeploys).
-- **Webhook Registration**: `setupWebhook()` (`telegram.gs`) — Registers GAS Web App URL with Telegram Bot API. Run manually after deployment.
-- **Email Processing Trigger**: `processDapEmails()` (`dap_extractor.gs`) — Scheduled time-driven trigger.
-- **Daily Liquidation Trigger**: `checkAndLiquidateDaps()` (`dap_cron.gs`) — Scheduled daily time-driven trigger.
-- **Webhook Endpoint**: `doPost(e)` (`telegram.gs`) — Receives Telegram updates.
-- **Historical Backfill**: `backfillDapEmails(monthsBack, maxThreads)` (`dap_extractor.gs`) — Manual one-off run to reprocess emails outside the normal 30-day window. Safe to re-run (Gmail label exclusion prevents duplicates).
-- **Completed-DAP Audit/Repair** (`dap_repair.gs`): `auditCompletedDaps()` is the SIMULATION (log only) and `repairCompletedDapsApply()` applies it. Fixed order: Sheet (a) mark as liquidated the DAPs whose liquidation date has passed or that Notion already flags as liquidated; (b) unliquidated RENOVABLE DAPs whose tentative liquidation date is outside a renewal window are logged with 🚨 and corrected to the nearest valid date; (c) COMPLETADO rows without `Notion_Page_ID` are pushed (upsert by `ID operación`); then Notion (a) duplicate pages by `ID operación`: keep the newest (`created_time`), complement it with what older pages had (`_complementExistingNotionPage`, fill-if-empty), archive the older ones (`archiveNotionPage`, recoverable from Notion's trash), relink Sheet rows that pointed to archived pages, and mirror the Sheet changes of (a)/(b) into the surviving pages. Groups whose pages disagree on Monto/Tipo/dates are skipped (`⛔`) for manual review; Objetivo differences are logged (`↔️`) and the newest Objetivo wins. Always run the simulation first.
-- **Version Check**: Telegram command `/version` replies with `APP_VERSION` (`config.gs`). Bump `APP_VERSION` on every delivery.
-- **Queue Release**: `releaseDapQueue()` (`dap_maintenance.gs`) — Manual: clears the FSM cache keys, returns `ESPERANDO_TELEGRAM` rows to `PENDIENTE_OBJETIVO` and re-runs the queue. Use after interrupting Telegram conversations.
-- **UF Repair**: `repairUfDapAmounts()` (dry-run, log only) then `repairUfDapAmountsApply()` (`dap_maintenance.gs`) — Manual: re-parses every row's email, recomputes the CLP amount of UF DAPs and fixes Sheet + Notion `Monto` (includes `COMPLETADO` rows).
-- **Data Repair**: `auditPendingDapOperaciones()` (`dap_maintenance.gs`) — Manual one-off run after a `dap_parser.gs` fix: re-parses the original email (via `ID_Mensaje_Email`) for every row not yet `COMPLETADO` and corrects `ID_Operacion` if it no longer matches. Never touches `COMPLETADO` rows (may already be synced to Notion).
+## Entrypoints & Functions
+
+Time-driven triggers (all created by `installDapApp()`, idempotent; table in `setup.gs` `_TRIGGER_SPECS`):
+- `processDapEmails()` every 15 min · `checkAndLiquidateDaps()` daily 08:00 · `retryNotionSync()` every 30 min · `watchdogTick()` hourly · `healthCheck()` daily 07:00 · `parserCanary()` Mondays 09:00 · `backupSheet()` Sundays 03:00.
+
+Web App (deployed, `ANYONE_ANONYMOUS`, executes as owner):
+- `doPost(e)` (`telegram.gs`): Telegram webhook. `doGet(e)`: returns `APP_VERSION` only with the secret token (used by `healthCheck` to detect a stale deployment).
+- Telegram commands: `/start`, `/version`, `/liquidar N`.
+
+Manual tools:
+- `installDapApp()` — sheet (headers migration, validations, checkboxes, formats, protected header), Gmail labels, triggers. Safe to re-run after every deploy.
+- `setupWebhook()` — registers the Web App URL (`?token=`) with Telegram; resets `LAST_UPDATE_ID`. Run after creating a new deployment URL.
+- `releaseDapQueue()` (`dap_ops.gs`) — returns `ESPERANDO_TELEGRAM` rows to `PENDIENTE_OBJETIVO`, clears legacy cache keys, re-runs the queue.
+- `healthCheck()` — runs all checks now and returns the findings.
+- Archived (commented) in `dap_archive.gs`: `backfillDapEmails`, `auditPendingDapOperaciones*`, `repairUfDapAmounts*`, `auditCompletedDaps` / `repairCompletedDapsApply` and their Notion helpers. The file lists origin, purpose, when to reuse, dependencies and order; `dap_repair.gs` and `dap_maintenance.gs` were deleted entirely.
 
 ## Environment Variables (`PropertiesService.getScriptProperties()`)
 
-Retrieved via `getEnv(key)` defined in `config.gs`. Required keys:
-- `SHARED_SPREADSHEET_ID`: Target Google Sheet ID.
-- `TELEGRAM_BOT_TOKEN`: Telegram bot auth token.
-- `TELEGRAM_CHAT_ID`: Authorized Telegram user/chat ID (enforced by security check).
-- `TELEGRAM_SECRET_TOKEN`: Secret query token (`?token=`) for webhook URL validation.
-- `WEB_APP_URL`: URL of deployed GAS Web App.
-- `NOTION_API_TOKEN`: Notion Integration Bearer token.
-- `NOTION_DAP_DATABASE_ID`: Notion target database UUID.
-- `CMF_API_KEY`: API key of the CMF (Chile) used to fetch the UF value (`uf.gs`). Script Property only — never in code, logs or the repo.
+Retrieved via `getEnv(key)` (`config.gs`); the full list is `CONFIG.REQUIRED_PROPERTIES` and `healthCheck` verifies it:
+- `SHARED_SPREADSHEET_ID` · `TELEGRAM_BOT_TOKEN` · `TELEGRAM_CHAT_ID` (authorized chat) · `TELEGRAM_SECRET_TOKEN` (webhook `?token=`; use ≥24 random chars) · `WEB_APP_URL` · `NOTION_API_TOKEN` · `NOTION_DAP_DATABASE_ID` · `CMF_API_KEY` (CMF, UF value; never in code, logs or the repo).
+- Internal (managed by the code): `LAST_UPDATE_ID` (Telegram dedupe), `UF_FAILURES` (consecutive UF failures).
 
 ## Storage, Schema & Queue Protocol
 
-- **Sheet Name**: `DAPs` (`CONFIG.SHEETS.DAPS`).
-- **Strict Column Order**: `[ID_Interno, ID_Operacion, Monto, Tipo_DAP, Fecha_Inicio, Fecha_Vencimiento, Objetivo, Fecha_Liquidacion, Liquidado, Estado_Cola, ID_Mensaje_Email, Notion_Page_ID]`
-- **Queue States (`Estado_Cola`)**: `PENDIENTE_OBJETIVO` -> `ESPERANDO_TELEGRAM` -> `COMPLETADO`.
-- **FSM Cache Keys (`CacheService`)**: `${chatId}_ACTIVE_DAP` & `${chatId}_DAP_STEP` (6-hour / 21600s TTL).
-- **Gmail Idempotency Label**: `SaaS_Inversiones/DAP_Procesado` (`CONFIG.GMAIL.LABEL_DAP_PROCESSED`).
+- **Sheet** `DAPs` (`CONFIG.SHEETS.DAPS`). Column order = `CONFIG.HEADERS.DAPS`: `ID_Interno, ID_Operacion, Monto, Tipo_DAP, Fecha_Inicio, Fecha_Vencimiento, Objetivo, Fecha_Liquidacion, Liquidado, Estado_Cola, ID_Mensaje_Email, Notion_Page_ID, Moneda, Monto_Original, Valor_UF, Paso_Conversacion, Ultimo_Aviso, Avisos_Enviados, Notion_Intentos`. New columns are always appended; `_assertSchema()` (called by `_openDapSheet()`) adds missing trailing headers and **throws if an existing column was renamed/moved**. `Monto` is always CLP (UF DAPs: `Monto_Original` = UF amount, `Valor_UF` = value used). `ID_Operacion` is stored as a number (leading zeros are not significant).
+- **States** (`CONFIG.STATES`): `PENDIENTE_OBJETIVO` -> `ESPERANDO_TELEGRAM` (with `Paso_Conversacion` = `ESPERANDO_OBJETIVO` | `ESPERANDO_LIQUIDACION`) -> `COMPLETADO`; if Notion fails on finalize: `PENDIENTE_NOTION` (`Notion_Intentos`) -> `retryNotionSync` -> `COMPLETADO`.
+- **Conversation state is in the Sheet, not the cache** (cache can be evicted). The active DAP is the single row in `ESPERANDO_TELEGRAM`. `Ultimo_Aviso`/`Avisos_Enviados` drive reminders (after `CONFIG.FSM.REMINDER_HOURS`, max `CONFIG.FSM.MAX_REMINDERS`, then an admin alert).
+- **Gmail labels**: `SaaS_Inversiones/DAP_Procesado` (done) and `SaaS_Inversiones/DAP_Error` (email the parser could not read; needs manual review and triggers an alert). A thread is labeled "processed" only if every message was resolved.
 
 ## Technical Conventions & Gotchas
 
-- **Concurrency Locks**: `dap_cron.gs`, `dap_queue.gs`, and `dap_extractor.gs` acquire `LockService.getScriptLock().tryLock(10000)` to prevent parallel executions.
-- **Sheet Mutation**: Always execute `SpreadsheetApp.flush()` after modifying Sheet values before calling external APIs (Notion/Telegram).
-- **Webhook Security**: `doPost(e)` verifies both `e.parameter.token === TELEGRAM_SECRET_TOKEN` and `incomingChatId === TELEGRAM_CHAT_ID`.
-- **Single Active DAP Invariant**: `pingNextPendingDap()` (`dap_queue.gs`) must check `${chatId}_ACTIVE_DAP` in `CacheService` before advancing the queue. Without this guard, a new email arriving mid-conversation overwrites the FSM cache and permanently orphans the previous row in `ESPERANDO_TELEGRAM` (it's no longer `PENDIENTE_OBJETIVO`, so the queue never revisits it, and the cache no longer points to it). Do not remove this check.
-- **Column Access**: Never index sheet rows/ranges with raw numbers. Use `DAP_COLS.<HeaderName>` (`config.gs`, derived from `CONFIG.HEADERS.DAPS`) so column access stays correct if the header order ever changes.
-- **Outbound HTTP**: `sendTelegramMessage`, `pushDapToNotion`, and `updateNotionDapStatus` go through `_fetchWithRetry()` (`utils.gs`), which retries on network exceptions/5xx and gives up immediately on 4xx.
-- **Notion Upsert**: `pushDapToNotion()` (`notion.gs`) looks up the DAP by `ID operación` (`_findNotionPageByOperacion`) before creating. If found, it complements only empty fields and upgrades `Liquidado` false→true (never the reverse, never overwrites a present value) instead of creating a duplicate page. Relies on `ID_Operacion` being extracted correctly — see next point.
-- **Email Regex Line-Crossing**: In `dap_parser.gs`, `[^\d]` character classes match newlines too. A bare `[^\d]*` gap between a label and its value can silently cross into an unrelated table row/section if a generic fallback alternative (e.g. `Operaci.n`) matches earlier in the email than the intended field (e.g. a "Detalle de la operación" heading before the real data table) — this actually happened in production (captured "N° Transacción" instead of "N° Depósito"). All label→value gaps in `MONTO`, `FECHA_INICIO`, `FECHA_VENCIMIENTO`, and `OPERACION_CANDIDATES` use the shared `_GAP` string (`dap_parser.gs`) instead: the label and value may be on the same line, or on following lines as long as the lines in between contain ONLY separators (spaces, `:`, `$`, `UF`) or are blank — this covers both BCI templates (2-cell rows and 3-cell rows `label / ":" or "$" / value`, which Gmail may render one cell per line) — but it never crosses a line holding another label. Tests in `tests/dap_parser_renovable.test.js` cover 4 plain-text layouts of the real renewable email; keep them passing when touching `_GAP`. JS string gotcha: `_GAP` is built with `new RegExp(string)`, so backslashes must be doubled (`'\\d'`). `OPERACION_CANDIDATES` is also tried as a priority-ordered list (first pattern that matches anywhere wins), not a single combined alternation, specifically to avoid leftmost-match picking a less-specific alternative over a more reliable one. Don't revert to a single unbounded `[^\d]*` or a combined alternation for these fields.
-- **Deployment Versions (Web App)**: the Telegram webhook (`doPost`) runs the DEPLOYED VERSION of the Web App, not the latest editor code; editor runs and time-driven triggers do run the latest code. After every import/push, create a new version (Deploy → Manage deployments → edit the Web App deployment → Version: "New version" → Deploy; the URL stays the same, no need to re-run `setupWebhook()`), then send `/version` to the bot and compare with `APP_VERSION`. Symptom of forgetting it: the first Telegram message (sent by a manual editor run) has the new format and the following ones (sent via webhook) the old one.
-- **Sheets Dates**: Values from `getValues()` come from another realm, so `instanceof Date` is `false`. Never use it (nor `new Date("yyyy-MM-dd")`, which is parsed as UTC and can shift the day). Use `_toIsoDate()` / `_isDateObject()` / `_formatDateLong()` (`utils.gs`). This bug made Telegram show raw `Date.toString()` output and would have kept `checkAndLiquidateDaps()` from ever liquidating.
-- **UF DAPs**: `parseBciDapEmail` detects `Moneda` (UF vs CLP) and keeps the parser pure (no network); `Monto` is `null` for UF until `_enrichWithClpAmount()` (`uf.gs`) converts it using the UF value of the capture date (`getUfValue`, CMF API, cached). If the UF value can't be fetched, the extractor does not enqueue the message nor label its thread, so it is retried on the next run. `UF 4,4379` uses decimal comma — `_parseChileanNumber`.
-- **Log Redaction**: `_fetchWithRetry` logs URLs through `_redactUrl` (strips query string and `/bot<token>/`). Any new integration must not put secrets in logged text.
-- **Renewable DAPs (`renewal.gs`)**: a RENOVABLE DAP renews every `plazo` days (`Fecha_Vencimiento − Fecha_Inicio`; the email's "Fecha de Vencimiento" is the first renewal date, Fecha1). A "window" is `[Fecha1 + k·plazo, +2 business days]` (Mon–Fri minus optional `CONFIG.HOLIDAYS`). The Telegram prompt shows the plazo and the next window instead of the expiry date, and in step `ESPERANDO_LIQUIDACION` the tentative liquidation date must fall inside some window: otherwise the bot proposes the nearest valid date and keeps asking (`'saltar'` still skips). Dates are parsed by `_parseUserDate` (`YYYY-MM-DD`, `DD-MM-YYYY`, `DD/MM/YYYY`). Numbers in UF use `_parseFlexibleNumber` because the two BCI templates format decimals differently (`4,4379` vs `1,525,000`).
-- **Queue Self-Healing**: `ACTIVE_DAP` expires after 6 h. Once the cache guard passes, `pingNextPendingDap()` treats `ESPERANDO_TELEGRAM` rows as orphaned and re-asks them (it used to only look at `PENDIENTE_OBJETIVO`).
-- **New-DAP Message**: built only by `_buildNewDapMessage()` (`dap_queue.gs`): internal ID, operation number, amount (always CLP; UF shows the conversion), original currency, capture date, and expiry date (FIJO) or renewal plazo + next window (RENOVABLE). Dates via `_formatDateLong`. No other code path sends this notice.
-- **Duplicate Messages**: `_runDapEmailExtraction` skips messages whose `ID_Mensaje_Email` is already in the sheet, so a retried thread never duplicates rows.
-- **Code Style**: Vanilla modern JS (ES6+, `'use strict'`), JSDoc comments, private helpers prefixed with `_`.
+- **Locks**: never nest `LockService`. Use `_withScriptLock(fn, timeoutMs)` (`utils.gs`) — it reuses the lock already held by the execution. `doPost`, the queue, the extractor, cron, outbox and backup all go through it.
+- **Telegram idempotency**: `doPost` dedupes by `update_id` (`_registerUpdate`); Telegram retries slow webhooks. `sendTelegramMessage` returns a boolean, retries as plain text on HTML parse errors and splits >4096 chars — always escape user text with `_escapeHtml`.
+- **User text**: the Objetivo is validated (`_validateObjetivo`, ≤200 chars) and written as plain text (`_setPlainText`) so it can never be a formula.
+- **Parser is strict** (`parseBciDapEmailDetailed` → `{ok, dto | error{code,message}}`): missing/incoherent data is an error, never a default. Do not reintroduce defaults (Tipo→FIJO, dates→email date, currency→CLP). Every new bank template or parser change needs a real anonymized fixture in `tests/parser.test.js`.
+- **Email regex line-crossing**: the shared `_GAP` (`dap_parser.gs`) lets a label and its value sit on the same line or on following lines as long as intermediate lines contain only separators (spaces, `:`, `$`, `UF`) or are blank; it never crosses a line holding another label. Do not use a bare `[^\d]*`. `OPERACION_CANDIDATES` is a priority list (first pattern that matches anywhere wins). `_GAP` is built with `new RegExp(string)`: double the backslashes.
+- **Sheets dates**: values from `getValues()` come from another realm, so `instanceof Date` is `false`. Use `_toIsoDate()` / `_isDateObject()` / `_toEpochMs()` (never `new Date(text)`: MM/DD ambiguity).
+- **Column access**: always `DAP_COLS.<Header>`, never raw numbers. Open the sheet with `_openDapSheet()`; look rows up with `_findRowByInternalId` / `_findActiveConversation`.
+- **Notion**: `pushDapToNotion` is an upsert by `ID operación` (newest page wins when duplicated) that only fills empty fields and upgrades `Liquidado` false→true. Property names live in `CONFIG.NOTION.PROPS` (`_validateNotionSchema` checks them). Notion errors never block the flow: finalize → `PENDIENTE_NOTION`; cron marks the Sheet only after Notion succeeded.
+- **Network**: all outbound HTTP goes through `_fetchWithRetry` (retries network errors, 5xx and 429 honoring `Retry-After`). URLs are logged only through `_redactUrl` — never put secrets in log text.
+- **Gmail search**: `-label:` with nested labels is undocumented, so both `Parent/Child` and `Parent-Child` forms are excluded, labeled threads are also skipped in code, and `healthCheck` verifies the exclusion. Sender is validated by exact domain (`_isAllowedSender`), not by Gmail's partial `from:`.
+- **UF**: `getUfValue` (CMF, cached; fallback mindicador.cl; alert after 3 consecutive failures). If the value is unavailable the email is neither enqueued nor labeled (retried next run).
+- **Renewable DAPs** (`renewal.gs`): plazo = `Fecha_Vencimiento − Fecha_Inicio`; the email's expiry is the first renewal date; windows are `[Fecha1 + k·plazo, +2 business days]` (Mon–Fri minus `CONFIG.HOLIDAYS`); the tentative liquidation date must fall inside one (the bot proposes the nearest valid date until it does).
+- **Deployment versions**: the Telegram webhook runs the **deployed version** of the Web App, not the latest editor code (editor runs and triggers do use the latest). After every import/push create a new version (Deploy → Manage deployments → edit → Version: New version); the URL stays the same. Verify with `/version` or `healthCheck` (compares `doGet` with `APP_VERSION`). Bump `APP_VERSION` on every delivery.
+- **Explicit OAuth scopes** (`appsscript.json`): Gmail, Sheets, external requests, triggers. If Apps Script reports insufficient permissions after an import, re-authorize by running any function; last resort: remove `oauthScopes`.
+- **Code style**: vanilla modern JS (ES6+, `'use strict'`), JSDoc with types on every function, private helpers prefixed with `_`, no comments that explain the obvious.
+
+## Runbook
+
+- **Deploy**: import the code → run `installDapApp()` → create a new Web App version → send `/version` → run `healthCheck()`.
+- **Conversation stuck / no prompts**: run `releaseDapQueue()`; the hourly `watchdogTick` also re-drives the queue and sends reminders.
+- **Notion down**: DAPs stay `PENDIENTE_NOTION`; `retryNotionSync` retries every 30 min (max `CONFIG.NOTION.MAX_SYNC_ATTEMPTS`, then an alert). After fixing the cause reset `Notion_Intentos` to 0 in the Sheet.
+- **Unreadable email** (alert "No pude interpretar un correo de DAP"): review the thread labeled `DAP_Error`; if the template changed add a fixture and fix the parser, deploy, remove the label from the thread and run `processDapEmails()`.
+- **Rotate secrets**: change the property, run `setupWebhook()` if the bot token or `TELEGRAM_SECRET_TOKEN` changed, then create a new Web App version. Regenerate the CMF key if it was ever shared.
+- **Restore data**: copy a hidden `Backup_YYYY-MM-DD` tab (8 kept) over the `DAPs` tab; Google Sheets version history covers loss of the whole file.
+- **Reuse archived tools**: see the header of `dap_archive.gs` (select the code block, toggle comments with Ctrl+/, run the simulation first, comment it again afterwards).
+- **Alerts for failures before Telegram can be used**: link the script to a standard GCP project and create a Cloud Logging alert on `severity=ERROR`.
 
 ## Local Development
 
-- **Tooling**: `package.json` + `clasp` (Google Apps Script CLI) for local edit/push, `eslint` for linting, `jest` for unit tests. No transpilation/bundling — files stay plain `.gs`/CommonJS-free scripts pushed as-is.
-- **Setup**: `npm install`, then `npx clasp login` and copy `.clasp.json.example` to `.clasp.json` with your own `scriptId` (never commit `.clasp.json` — it's gitignored).
-- **Commands**: `npm run lint`, `npm test`, `npm run push` (`clasp push`).
-- **Tests**: `tests/` loads `.gs` files via `tests/helpers/loadGasFile.js` (a small `vm`-based loader with stubbed GAS globals), since these files aren't CommonJS modules. Covers `dap_parser.gs` (regex extraction, including a regression test for the "N° Transacción vs N° Depósito" bug), the `pingNextPendingDap` active-session guard, and the `notion.gs` upsert logic.
-- **What's not testable here**: end-to-end Gmail/Sheets/Telegram/Notion flows require a real deployment; after `clasp push`, run `installDapApp()` once from the Apps Script editor to confirm triggers are created, then send a test BCI email through `processDapEmails()`.
+- `package.json` + `eslint` + `jest` (+ `clasp`) live on disk but are **not tracked** (`.gitignore`): only `.gs`, `appsscript.json` and `.md` files are committed. `.eslintrc.js` generates the shared globals from the top-level declarations of every `.gs`.
+- Commands: `npm test`, `npm run lint`. Tests load the whole project into one context with in-memory Sheets, Gmail, Notion, Telegram, cache, locks and triggers (`tests/helpers/harness.js`); `tests/archive.test.js` uncomments `dap_archive.gs` in memory and runs the archived functions, so the archive stays valid. Archived code is edited by hand in `dap_archive.gs` (each line prefixed with `// `).
+- Not testable locally: real Gmail/Sheets/Telegram/Notion behavior; after deploying run `installDapApp()`, `healthCheck()` and answer one DAP end to end.

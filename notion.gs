@@ -8,18 +8,19 @@
  * Genera los encabezados estándar requeridos por la API de Notion.
  * @private
  * @param {string} token - Token de integración de Notion (Bearer).
- * @returns {Object} Cabeceras HTTP listas para UrlFetchApp.
+ * @returns {Object<string, string>} Cabeceras HTTP listas para UrlFetchApp.
  */
 function _getNotionHeaders(token) {
   return {
     'Authorization': `Bearer ${token}`,
     'Content-Type': 'application/json',
-    'Notion-Version': '2022-06-28'
+    'Notion-Version': CONFIG.NOTION.VERSION
   };
 }
 
 /**
- * Busca en la base de datos de Notion una página cuyo "ID operación" coincida.
+ * Busca en la base de datos de Notion la página cuyo "ID operación" coincida. Si hubiera
+ * duplicadas, devuelve la MÁS RECIENTE (misma política que la deduplicación).
  * @private
  * @param {string} token - Token de integración de Notion.
  * @param {string} dbId - ID de la base de datos de Notion.
@@ -29,20 +30,24 @@ function _getNotionHeaders(token) {
  *   y se procede a crear, para no bloquear el flujo por un error transitorio).
  */
 function _findNotionPageByOperacion(token, dbId, idOperacion) {
+  if (!Number.isFinite(idOperacion)) {
+    console.warn('⚠️ Notion: ID de operación no numérico; no se puede buscar una página existente.');
+    return null;
+  }
+
   const url = `https://api.notion.com/v1/databases/${dbId}/query`;
   const payload = {
-    filter: { property: 'ID operación', number: { equals: idOperacion } },
+    filter: { property: CONFIG.NOTION.PROPS.ID_OPERACION, number: { equals: idOperacion } },
+    sorts: [{ timestamp: 'created_time', direction: 'descending' }],
     page_size: 1
   };
 
-  const options = {
+  const res = _fetchWithRetry(url, {
     method: 'post',
     headers: _getNotionHeaders(token),
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
-  };
-
-  const res = _fetchWithRetry(url, options);
+  });
   if (!res) return null;
 
   const code = res.getResponseCode();
@@ -60,7 +65,7 @@ function _findNotionPageByOperacion(token, dbId, idOperacion) {
  * @private
  * @param {Object} page - Objeto de página de Notion (con `.properties`).
  * @param {string} propName - Nombre de la propiedad tal como está en el esquema de Notion.
- * @param {string} type - Tipo de propiedad: 'number' | 'checkbox' | 'date' | 'select' | 'title'.
+ * @param {'number'|'checkbox'|'date'|'select'|'title'} type - Tipo de propiedad.
  * @returns {*} El valor actual, o null si está vacía/ausente.
  */
 function _readNotionProperty(page, propName, type) {
@@ -78,45 +83,31 @@ function _readNotionProperty(page, propName, type) {
 }
 
 /**
- * Lista todas las páginas de la base de datos de Notion (paginado de a 100).
+ * Construye el DTO que se envía a Notion a partir de una fila de la hoja DAPs.
  * @private
- * @param {string} token - Token de integración de Notion.
- * @param {string} dbId - ID de la base de datos de Notion.
- * @returns {Object[]|null} Páginas (id + properties), o null si alguna consulta falla.
+ * @param {Array} row - Fila de la hoja (valores de getValues).
+ * @returns {Object} DTO con fechas ISO (`Fecha_Liquidacion` es null si está vacía).
  */
-function _listAllNotionPages(token, dbId) {
-  const url = `https://api.notion.com/v1/databases/${dbId}/query`;
-  const pages = [];
-  let cursor = null;
-
-  for (let i = 0; i < 100; i++) {
-    const payload = { page_size: 100 };
-    if (cursor) payload.start_cursor = cursor;
-
-    const res = _fetchWithRetry(url, {
-      method: 'post',
-      headers: _getNotionHeaders(token),
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    });
-    if (!res || res.getResponseCode() !== 200) return null;
-
-    const json = JSON.parse(res.getContentText());
-    pages.push(...(json.results || []));
-    if (!json.has_more) return pages;
-    cursor = json.next_cursor;
-  }
-
-  return pages;
+function _buildDapDtoFromRow(row) {
+  return {
+    ID_Interno: row[DAP_COLS.ID_Interno - 1],
+    ID_Operacion: row[DAP_COLS.ID_Operacion - 1],
+    Monto: row[DAP_COLS.Monto - 1],
+    Tipo_DAP: row[DAP_COLS.Tipo_DAP - 1],
+    Fecha_Inicio: _toIsoDate(row[DAP_COLS.Fecha_Inicio - 1]),
+    Fecha_Vencimiento: _toIsoDate(row[DAP_COLS.Fecha_Vencimiento - 1]),
+    Objetivo: row[DAP_COLS.Objetivo - 1],
+    Fecha_Liquidacion: _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]) || null,
+    Liquidado: _isChecked(row[DAP_COLS.Liquidado - 1])
+  };
 }
 
 /**
  * Crea (o complementa, si ya existe por "ID operación") un registro de DAP en Notion.
- * Evita duplicados: si ya existe una página con el mismo número de operación (por ejemplo,
- * al reprocesar correos históricos con `backfillDapEmails()`), no crea una página nueva, sino
- * que completa únicamente los campos vacíos en Notion —y sube "Liquidado" a `true` si
- * corresponde— sin pisar nunca datos ya presentes.
- * @param {DapDTO} dap - Objeto estructurado con los datos del depósito.
+ * Evita duplicados: si ya existe una página con el mismo número de operación, no crea una
+ * página nueva, sino que completa únicamente los campos vacíos en Notion —y sube "Liquidado" a
+ * `true` si corresponde— sin pisar nunca datos ya presentes.
+ * @param {Object} dap - DTO del depósito (ver `_buildDapDtoFromRow`).
  * @returns {string|null} El ID de la página (nueva o ya existente) en Notion, o null si falla.
  */
 function pushDapToNotion(dap) {
@@ -128,11 +119,11 @@ function pushDapToNotion(dap) {
     return null;
   }
 
-  const idOperacion = parseInt(dap.ID_Operacion, 10);
+  const idOperacion = _normalizeOperationId(dap.ID_Operacion);
   const existingPage = _findNotionPageByOperacion(token, dbId, idOperacion);
 
   if (existingPage) {
-    return _complementExistingNotionPage(token, existingPage, dap);
+    return _complementExistingNotionPage(token, existingPage, dap).id;
   }
 
   return _createNotionPage(token, dbId, dap);
@@ -141,37 +132,44 @@ function pushDapToNotion(dap) {
 /**
  * Crea una página nueva en la base de datos de Notion.
  * @private
+ * @param {string} token - Token de integración de Notion.
+ * @param {string} dbId - ID de la base de datos de Notion.
+ * @param {Object} dap - DTO del depósito.
+ * @returns {string|null} ID de la página creada, o null si falla.
  */
 function _createNotionPage(token, dbId, dap) {
-  const url = 'https://api.notion.com/v1/pages';
+  const P = CONFIG.NOTION.PROPS;
+  const idOperacion = _normalizeOperationId(dap.ID_Operacion);
+  if (!Number.isFinite(idOperacion)) {
+    console.error(`❌ Notion: No se crea la página: ID de operación inválido ("${dap.ID_Operacion}").`);
+    return null;
+  }
 
-  // Mapeo exacto al esquema de la base de datos
+  // Mapeo exacto al esquema de la base de datos. El título de Notion admite hasta 2000 caracteres.
   const payload = {
     parent: { database_id: dbId },
     properties: {
-      "Objetivo": { title: [{ text: { content: dap.Objetivo || "Sin Objetivo" } }] },
-      "ID operación": { number: parseInt(dap.ID_Operacion, 10) },
-      "Monto": { number: dap.Monto },
-      "Tipo DAP": { select: { name: dap.Tipo_DAP } },
-      "Fecha inicio": { date: { start: dap.Fecha_Inicio } },
-      "Fecha vencimiento": { date: { start: dap.Fecha_Vencimiento } },
-      "Liquidado": { checkbox: Boolean(dap.Liquidado) }
+      [P.OBJETIVO]: { title: [{ text: { content: _truncate(dap.Objetivo || 'Sin Objetivo', 2000) } }] },
+      [P.ID_OPERACION]: { number: idOperacion },
+      [P.MONTO]: { number: dap.Monto },
+      [P.TIPO]: { select: { name: dap.Tipo_DAP } },
+      [P.FECHA_INICIO]: { date: { start: dap.Fecha_Inicio } },
+      [P.FECHA_VENCIMIENTO]: { date: { start: dap.Fecha_Vencimiento } },
+      [P.LIQUIDADO]: { checkbox: Boolean(dap.Liquidado) }
     }
   };
 
   // Agregar la fecha de liquidación solo si existe para no enviar campos vacíos
   if (dap.Fecha_Liquidacion) {
-    payload.properties["Fecha liquidación"] = { date: { start: dap.Fecha_Liquidacion } };
+    payload.properties[P.FECHA_LIQUIDACION] = { date: { start: dap.Fecha_Liquidacion } };
   }
 
-  const options = {
+  const res = _fetchWithRetry('https://api.notion.com/v1/pages', {
     method: 'post',
     headers: _getNotionHeaders(token),
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
-  };
-
-  const res = _fetchWithRetry(url, options);
+  });
   if (!res) return null;
 
   const code = res.getResponseCode();
@@ -179,73 +177,68 @@ function _createNotionPage(token, dbId, dap) {
     const jsonRes = JSON.parse(res.getContentText());
     console.info(`✅ Notion: DAP [${dap.ID_Operacion}] creado correctamente.`);
     return jsonRes.id; // Retorna el Notion Page ID (ej. 13ef5...)
-  } else {
-    console.error(`❌ Error Notion API (POST): Código ${code} - ${res.getContentText()}`);
-    return null;
   }
+
+  console.error(`❌ Error Notion API (POST): Código ${code} - ${res.getContentText()}`);
+  return null;
 }
 
 /**
  * Complementa una página de Notion ya existente con los datos que le falten, sin pisar
  * valores ya presentes. "Liquidado" solo se sube de false a true, nunca al revés.
  * @private
- * @returns {string} El ID de la página existente (el PATCH puede fallar sin que esto afecte
- *   el retorno, ya que la página en sí ya existe).
+ * @param {string} token - Token de integración de Notion.
+ * @param {Object} existingPage - Página existente (id + properties).
+ * @param {Object} dap - DTO con los datos a complementar (campos ausentes se ignoran).
+ * @returns {{id: string, ok: boolean, changed: boolean}} `id` de la página existente; `ok` es false si
+ *   el PATCH de complemento falló (la página existe igualmente); `changed` indica si había algo que complementar.
  */
 function _complementExistingNotionPage(token, existingPage, dap) {
+  const P = CONFIG.NOTION.PROPS;
   const patchProps = {};
 
-  if (dap.Liquidado === true && _readNotionProperty(existingPage, 'Liquidado', 'checkbox') !== true) {
-    patchProps["Liquidado"] = { checkbox: true };
+  if (dap.Liquidado === true && _readNotionProperty(existingPage, P.LIQUIDADO, 'checkbox') !== true) {
+    patchProps[P.LIQUIDADO] = { checkbox: true };
   }
 
-  const currentObjetivo = _readNotionProperty(existingPage, 'Objetivo', 'title');
+  const currentObjetivo = _readNotionProperty(existingPage, P.OBJETIVO, 'title');
   if (dap.Objetivo && (!currentObjetivo || currentObjetivo === 'Sin Objetivo')) {
-    patchProps["Objetivo"] = { title: [{ text: { content: dap.Objetivo } }] };
+    patchProps[P.OBJETIVO] = { title: [{ text: { content: _truncate(dap.Objetivo, 2000) } }] };
   }
 
-  if (dap.Fecha_Liquidacion && !_readNotionProperty(existingPage, 'Fecha liquidación', 'date')) {
-    patchProps["Fecha liquidación"] = { date: { start: dap.Fecha_Liquidacion } };
+  if (dap.Fecha_Liquidacion && !_readNotionProperty(existingPage, P.FECHA_LIQUIDACION, 'date')) {
+    patchProps[P.FECHA_LIQUIDACION] = { date: { start: dap.Fecha_Liquidacion } };
   }
 
-  const currentMonto = _readNotionProperty(existingPage, 'Monto', 'number');
+  const currentMonto = _readNotionProperty(existingPage, P.MONTO, 'number');
   if ((dap.Monto || dap.Monto === 0) && currentMonto === null) {
-    patchProps["Monto"] = { number: dap.Monto };
+    patchProps[P.MONTO] = { number: dap.Monto };
   }
 
-  if (dap.Tipo_DAP && !_readNotionProperty(existingPage, 'Tipo DAP', 'select')) {
-    patchProps["Tipo DAP"] = { select: { name: dap.Tipo_DAP } };
+  if (dap.Tipo_DAP && !_readNotionProperty(existingPage, P.TIPO, 'select')) {
+    patchProps[P.TIPO] = { select: { name: dap.Tipo_DAP } };
   }
 
-  if (dap.Fecha_Inicio && !_readNotionProperty(existingPage, 'Fecha inicio', 'date')) {
-    patchProps["Fecha inicio"] = { date: { start: dap.Fecha_Inicio } };
+  if (dap.Fecha_Inicio && !_readNotionProperty(existingPage, P.FECHA_INICIO, 'date')) {
+    patchProps[P.FECHA_INICIO] = { date: { start: dap.Fecha_Inicio } };
   }
 
-  if (dap.Fecha_Vencimiento && !_readNotionProperty(existingPage, 'Fecha vencimiento', 'date')) {
-    patchProps["Fecha vencimiento"] = { date: { start: dap.Fecha_Vencimiento } };
+  if (dap.Fecha_Vencimiento && !_readNotionProperty(existingPage, P.FECHA_VENCIMIENTO, 'date')) {
+    patchProps[P.FECHA_VENCIMIENTO] = { date: { start: dap.Fecha_Vencimiento } };
   }
 
   if (Object.keys(patchProps).length === 0) {
     console.info(`ℹ️ Notion: DAP [${dap.ID_Operacion}] ya existía y no requería cambios.`);
-    return existingPage.id;
+    return { id: existingPage.id, ok: true, changed: false };
   }
 
-  const url = `https://api.notion.com/v1/pages/${existingPage.id}`;
-  const options = {
-    method: 'patch',
-    headers: _getNotionHeaders(token),
-    payload: JSON.stringify({ properties: patchProps }),
-    muteHttpExceptions: true
-  };
-
-  const res = _fetchWithRetry(url, options);
-  if (!res || res.getResponseCode() !== 200) {
+  if (!patchNotionPageProperties(existingPage.id, patchProps)) {
     console.error(`❌ Notion: DAP [${dap.ID_Operacion}] ya existía pero falló al complementar campos.`);
-    return existingPage.id;
+    return { id: existingPage.id, ok: false, changed: true };
   }
 
   console.info(`✅ Notion: DAP [${dap.ID_Operacion}] ya existía; se complementaron sus campos vacíos.`);
-  return existingPage.id;
+  return { id: existingPage.id, ok: true, changed: true };
 }
 
 /**
@@ -255,18 +248,7 @@ function _complementExistingNotionPage(token, existingPage, dap) {
  * @returns {boolean} true si la mutación fue exitosa, false si falló.
  */
 function updateNotionDapStatus(pageId) {
-  return patchNotionPageProperties(pageId, { "Liquidado": { checkbox: true } });
-}
-
-/**
- * Sobrescribe el campo "Monto" (en CLP) de una página de Notion. Solo lo usa la reparación
- * manual de DAP en UF; el upsert normal (`pushDapToNotion`) nunca pisa valores existentes.
- * @param {string} pageId - El ID único de la página en Notion.
- * @param {number} monto - Monto en CLP.
- * @returns {boolean} true si la mutación fue exitosa, false si falló.
- */
-function updateNotionDapAmount(pageId, monto) {
-  return patchNotionPageProperties(pageId, { "Monto": { number: monto } });
+  return patchNotionPageProperties(pageId, { [CONFIG.NOTION.PROPS.LIQUIDADO]: { checkbox: true } });
 }
 
 /**
@@ -283,148 +265,48 @@ function patchNotionPageProperties(pageId, properties) {
     return false;
   }
 
-  const url = `https://api.notion.com/v1/pages/${pageId}`;
-
-  const options = {
+  const res = _fetchWithRetry(`https://api.notion.com/v1/pages/${pageId}`, {
     method: 'patch',
     headers: _getNotionHeaders(token),
     payload: JSON.stringify({ properties: properties }),
     muteHttpExceptions: true
-  };
-
-  const res = _fetchWithRetry(url, options);
+  });
   if (!res) return false;
 
   const code = res.getResponseCode();
   if (code === 200) {
     console.info(`✅ Notion: página [${pageId}] actualizada (${Object.keys(properties).join(', ')}).`);
     return true;
-  } else {
-    console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);
-    return false;
-  }
-}
-/**
- * Construye el DTO que se envía a Notion a partir de una fila de la hoja DAPs.
- * @private
- * @param {Array} row - Fila de la hoja (valores de getValues).
- * @returns {Object} DTO con fechas ISO (`Fecha_Liquidacion` es null si está vacía).
- */
-function _buildDapDtoFromRow(row) {
-  return {
-    ID_Interno: row[DAP_COLS.ID_Interno - 1],
-    ID_Operacion: row[DAP_COLS.ID_Operacion - 1],
-    Monto: row[DAP_COLS.Monto - 1],
-    Tipo_DAP: row[DAP_COLS.Tipo_DAP - 1],
-    Fecha_Inicio: _toIsoDate(row[DAP_COLS.Fecha_Inicio - 1]),
-    Fecha_Vencimiento: _toIsoDate(row[DAP_COLS.Fecha_Vencimiento - 1]),
-    Objetivo: row[DAP_COLS.Objetivo - 1],
-    Fecha_Liquidacion: _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]) || null,
-    Liquidado: row[DAP_COLS.Liquidado - 1]
-  };
-}
-
-/**
- * Archiva una página de Notion (queda en la papelera de Notion y es restaurable desde ahí;
- * no se borra de forma permanente).
- * @param {string} pageId - El ID único de la página en Notion.
- * @returns {boolean} true si se archivó, false si falló.
- */
-function archiveNotionPage(pageId) {
-  const token = getEnv('NOTION_API_TOKEN');
-  if (!token || !pageId) {
-    console.error('❌ Notion API: Falta Token o Page ID para archivar la página.');
-    return false;
   }
 
-  const res = _fetchWithRetry(`https://api.notion.com/v1/pages/${pageId}`, {
-    method: 'patch',
-    headers: _getNotionHeaders(token),
-    payload: JSON.stringify({ archived: true }),
-    muteHttpExceptions: true
-  });
-  if (!res) return false;
-
-  if (res.getResponseCode() === 200) {
-    console.info(`🗄️ Notion: página [${pageId}] archivada.`);
-    return true;
-  }
-  console.error(`❌ Error Notion API (archivar): Código ${res.getResponseCode()} - ${res.getContentText()}`);
+  console.error(`❌ Error Notion API (PATCH): Código ${code} - ${res.getContentText()}`);
   return false;
 }
 
 /**
- * Convierte una página de Notion a un DTO con los mismos nombres de campo que usa el Sheet.
- * Los campos vacíos quedan en null.
- * @private
- * @param {Object} page - Página de Notion (id + properties).
- * @returns {Object} DTO de la página.
+ * Verifica que la base de datos de Notion tenga las propiedades esperadas con el tipo correcto
+ * (si alguien renombra o cambia una propiedad, las escrituras empiezan a fallar con 400).
+ * @param {string} token - Token de integración de Notion.
+ * @param {string} dbId - ID de la base de datos de Notion.
+ * @returns {string[]} Problemas encontrados (lista vacía si el esquema es correcto).
  */
-function _notionPageToDap(page) {
-  const objetivo = _readNotionProperty(page, 'Objetivo', 'title');
-  return {
-    Objetivo: (objetivo && objetivo !== 'Sin Objetivo') ? objetivo : null,
-    Monto: _readNotionProperty(page, 'Monto', 'number'),
-    Tipo_DAP: _readNotionProperty(page, 'Tipo DAP', 'select'),
-    Fecha_Inicio: _readNotionProperty(page, 'Fecha inicio', 'date'),
-    Fecha_Vencimiento: _readNotionProperty(page, 'Fecha vencimiento', 'date'),
-    Fecha_Liquidacion: _readNotionProperty(page, 'Fecha liquidación', 'date'),
-    Liquidado: _readNotionProperty(page, 'Liquidado', 'checkbox') === true
-  };
-}
+function _validateNotionSchema(token, dbId) {
+  const res = _fetchWithRetry(`https://api.notion.com/v1/databases/${dbId}`, {
+    method: 'get',
+    headers: _getNotionHeaders(token),
+    muteHttpExceptions: true
+  });
+  if (!res) return ['No se pudo consultar la base de datos de Notion (sin respuesta).'];
+  if (res.getResponseCode() !== 200) return [`Notion respondió ${res.getResponseCode()} al leer la base de datos.`];
 
-/**
- * Planifica la deduplicación de páginas de Notion por "ID operación". Por cada grupo con más de
- * una página: se conserva la MÁS RECIENTE (`created_time`), y de las antiguas se toma solo la
- * información que a la conservada le falte (`merged`, en orden de la más nueva a la más vieja).
- * Un grupo se marca con `skipReason` (y no debe archivarse automáticamente) si las páginas
- * traen valores DISTINTOS de Monto, tipo o fechas de inicio/vencimiento, porque entonces
- * probablemente no son el mismo DAP. Diferencias solo de Objetivo se informan en `conflicts`
- * pero no bloquean (se conserva el Objetivo de la más reciente).
- * @private
- * @param {Object[]} pages - Páginas de Notion (id, created_time, properties).
- * @returns {{idOperacion: number, survivor: Object, olds: Object[], merged: Object, conflicts: string[], skipReason: string|null}[]}
- */
-function _planNotionDedupe(pages) {
-  const groups = {};
-  pages.forEach((page) => {
-    const idOperacion = _readNotionProperty(page, 'ID operación', 'number');
-    if (idOperacion === null) return;
-    (groups[idOperacion] = groups[idOperacion] || []).push(page);
+  const properties = (JSON.parse(res.getContentText()).properties) || {};
+  const problems = [];
+
+  Object.keys(CONFIG.NOTION.PROP_TYPES).forEach((name) => {
+    const expected = CONFIG.NOTION.PROP_TYPES[name];
+    if (!properties[name]) problems.push(`Falta la propiedad "${name}" (${expected}).`);
+    else if (properties[name].type !== expected) problems.push(`La propiedad "${name}" es ${properties[name].type} y debería ser ${expected}.`);
   });
 
-  const hasValue = (v) => v !== null && v !== undefined && v !== '';
-
-  return Object.keys(groups)
-    .filter((key) => groups[key].length > 1)
-    .map((key) => {
-      const sorted = groups[key].slice().sort((a, b) => String(b.created_time || '').localeCompare(String(a.created_time || '')));
-      const survivor = sorted[0];
-      const olds = sorted.slice(1);
-      const survivorDap = _notionPageToDap(survivor);
-      const merged = { ID_Operacion: key };
-      const conflicts = [];
-      let skipReason = null;
-
-      olds.forEach((old) => {
-        const oldDap = _notionPageToDap(old);
-
-        ['Monto', 'Tipo_DAP', 'Fecha_Inicio', 'Fecha_Vencimiento'].forEach((field) => {
-          if (hasValue(survivorDap[field]) && hasValue(oldDap[field]) && survivorDap[field] !== oldDap[field]) {
-            skipReason = skipReason || `${field} distinto entre páginas (${survivorDap[field]} vs ${oldDap[field]})`;
-          }
-        });
-
-        if (hasValue(survivorDap.Objetivo) && hasValue(oldDap.Objetivo) && survivorDap.Objetivo !== oldDap.Objetivo) {
-          conflicts.push(`Objetivo "${oldDap.Objetivo}" se descarta; se conserva "${survivorDap.Objetivo}"`);
-        }
-
-        ['Objetivo', 'Monto', 'Tipo_DAP', 'Fecha_Inicio', 'Fecha_Vencimiento', 'Fecha_Liquidacion'].forEach((field) => {
-          if (!hasValue(merged[field]) && hasValue(oldDap[field])) merged[field] = oldDap[field];
-        });
-        if (oldDap.Liquidado) merged.Liquidado = true;
-      });
-
-      return { idOperacion: Number(key), survivor: survivor, olds: olds, merged: merged, conflicts: conflicts, skipReason: skipReason };
-    });
+  return problems;
 }

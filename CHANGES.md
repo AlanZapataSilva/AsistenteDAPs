@@ -1,5 +1,29 @@
 # Registro de cambios
 
+## 2026-10-01 — Auditoría de producción (versión 2026-10-01.1)
+
+Auditoría completa del código y puesta en producción. Detalle de hallazgos, correcciones y verificaciones pendientes en `AUDITORIA.md`; evolución en `HOJA_DE_RUTA.md`. Etiqueta de rollback: `pre-produccion` (commit `eecce51`).
+
+**Fase 0 — archivo de funciones de completado de datos**
+- Nuevo `dap_archive.gs`: contiene, comentadas línea a línea, con JSDoc tipado y con fichas (ubicación original, para qué servían, cuándo reutilizarlas, dependencias, orden de ejecución y correcciones): `backfillDapEmails`, `auditPendingDapOperaciones` (+ Apply), `repairUfDapAmounts` (+ Apply), `auditCompletedDaps` / `repairCompletedDapsApply` (+ `_planSheetFixes`, `_repairCompletedDaps`) y los ayudantes de Notion `_listAllNotionPages`, `_notionPageToDap`, `_planNotionDedupe`, `archiveNotionPage`, `updateNotionDapAmount`. Se corrigieron antes de archivarlas (comparación numérica de operaciones, no archivar páginas si falló el complemento, presupuesto de tiempo, argumentos validados, desborde de meses, desempate determinista, etc.).
+- `dap_repair.gs` y `dap_maintenance.gs` **borrados completos**; `releaseDapQueue` sigue activa, ahora en `dap_ops.gs`.
+
+**Fase 1 — correcciones críticas**
+- Telegram: dedupe por `update_id`, todo bajo lock, `sendTelegramMessage` con resultado/troceo/fallback a texto plano, Objetivo validado/escapado/como texto plano, comandos desconocidos y `/liquidar` estrictos, `doGet` de versión.
+- Extractor: correos no interpretables → etiqueta `DAP_Error` + alerta (ya no se marcan procesados), remitente por dominio exacto, dedupe por N° de operación, ID interno = máximo, `try` por hilo, etiquetas creadas si faltan, presupuesto de tiempo.
+- Parser estricto (`parseBciDapEmailDetailed`): sin valores inventados, moneda extranjera rechazada, fechas validadas, fallback HTML decodificado.
+- Red: `_fetchWithRetry` reintenta 429 con `Retry-After`. Cron: `try` por fila, Notion antes que el Sheet, reporte escapado y troceado. Notion: página más reciente entre duplicadas, IDs validados, propiedades centralizadas.
+- Hoja: `_assertSchema` (migra columnas, falla si se renombra/mueve una), validaciones, casillas, formatos y encabezado protegido. `appsscript.json` con `oauthScopes` explícitos.
+
+**Fase 2 — resiliencia y observabilidad**
+- Estado de la conversación durable en el Sheet (`Paso_Conversacion`, `Ultimo_Aviso`, `Avisos_Enviados`), recordatorios y `watchdogTick` horario.
+- Outbox hacia Notion (`PENDIENTE_NOTION`, `Notion_Intentos`, `retryNotionSync`).
+- `_alertAdmin` con throttle; `healthCheck()` diario (propiedades, esquema, etiquetas y exclusión `-label:`, triggers, esquema de Notion, webhook, UF, versión desplegada, estados atascados); `parserCanary()` semanal; `backupSheet()` semanal; UF con respaldo en mindicador.cl.
+
+**Documentación y pruebas**: `AUDITORIA.md`, `HOJA_DE_RUTA.md`, `README.md` y `AGENTS.md` (runbook) reescritos. Batería local de 200+ tests sobre un arnés con Sheets/Gmail/Notion/Telegram simulados (`tests/helpers/harness.js`), incluida la validación del archivo.
+
+**Pasos de despliegue**: importar → `installDapApp()` (agrega las 4 columnas nuevas, validaciones y los 5 triggers nuevos) → crear una **nueva versión** del Web App → `/version` → `healthCheck()`. Si pide permisos, ejecutar cualquier función para autorizar los scopes explícitos.
+
 ## 2026-09-30 (2) — Auditoría y reparación completa de Sheet + Notion
 
 `auditCompletedDaps()` pasa a ser la **simulación** de un pipeline completo (solo log) y `repairCompletedDapsApply()` lo aplica (nuevo `dap_repair.gs`). Orden obligatorio:

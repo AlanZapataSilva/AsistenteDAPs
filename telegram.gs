@@ -1,5 +1,8 @@
 /**
- * @fileoverview telegram.gs - Webhook y Máquina de Estados (FSM) para DAPs
+ * @fileoverview telegram.gs - Webhook y Máquina de Estados (FSM) para DAPs.
+ * El estado de la conversación vive en el Sheet (columnas Estado_Cola / Paso_Conversacion), no
+ * en el caché: el caché puede evictarse antes de tiempo. El DAP activo es la fila en estado
+ * ESPERANDO_TELEGRAM.
  */
 
 'use strict';
@@ -7,22 +10,25 @@
 /**
  * Configura la URL del Webhook en la API de Telegram.
  * Debe ejecutarse manualmente una vez tras un Nuevo Despliegue.
+ * @returns {void}
  */
 function setupWebhook() {
   const botToken = getEnv('TELEGRAM_BOT_TOKEN');
-  const webAppUrl = getEnv('WEB_APP_URL'); 
+  const webAppUrl = getEnv('WEB_APP_URL');
   const secretToken = getEnv('TELEGRAM_SECRET_TOKEN');
-  
+
   if (!webAppUrl) {
     console.error("❌ Falta WEB_APP_URL. Debes hacer un Nuevo Despliegue primero.");
     return;
   }
-  
+
   const url = `${webAppUrl}?token=${secretToken}`;
-  const telegramUrl = `https://api.telegram.org/bot${botToken}/setWebhook?url=${encodeURIComponent(url)}&drop_pending_updates=true`;
-  
+  const telegramUrl = `https://api.telegram.org/bot${botToken}/setWebhook?url=${encodeURIComponent(url)}&drop_pending_updates=true&allowed_updates=${encodeURIComponent('["message"]')}`;
+
   try {
-    const res = UrlFetchApp.fetch(telegramUrl);
+    const res = UrlFetchApp.fetch(telegramUrl, { muteHttpExceptions: true });
+    // Si se cambia de bot, la numeración de update_id vuelve a empezar: se reinicia el dedupe
+    PropertiesService.getScriptProperties().deleteProperty('LAST_UPDATE_ID');
     console.info(`✅ Webhook configurado: ${res.getContentText()}`);
   } catch (error) {
     console.error(`❌ Fallo al configurar Webhook: ${error.message}`);
@@ -30,24 +36,14 @@ function setupWebhook() {
 }
 
 /**
- * Envía un mensaje de texto plano o HTML a un chat de Telegram.
- * @param {string|number} chatId - ID del chat destino.
- * @param {string} text - Contenido del mensaje.
+ * Envía un POST a la API de Telegram.
+ * @private
+ * @param {string} url - Endpoint completo (contiene el token del bot: no loguear).
+ * @param {Object} payload - Cuerpo JSON.
+ * @returns {GoogleAppsScript.URL_Fetch.HTTPResponse|null} Respuesta o null si falló la red.
  */
-function sendTelegramMessage(chatId, text) {
-  const botToken = getEnv('TELEGRAM_BOT_TOKEN');
-  const cleanToken = botToken ? botToken.trim() : "";
-  
-  if (!cleanToken || !chatId) return;
-
-  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
-  const payload = { 
-    chat_id: chatId.toString(), 
-    text: text, 
-    parse_mode: 'HTML' 
-  };
-  
-  _fetchWithRetry(url, {
+function _postTelegram(url, payload) {
+  return _fetchWithRetry(url, {
     method: 'post',
     contentType: 'application/json',
     payload: JSON.stringify(payload),
@@ -56,136 +52,229 @@ function sendTelegramMessage(chatId, text) {
 }
 
 /**
- * Endpoint de entrada (Webhook). Procesa todos los mensajes entrantes de Telegram.
- * @param {Object} e - Evento POST proporcionado por Google Apps Script.
+ * Envía un mensaje de texto (HTML) a un chat de Telegram. Trocea los mensajes que superen el
+ * límite de Telegram, y si Telegram rechaza el HTML (400 "can't parse entities") reintenta como
+ * texto plano para no perder el aviso.
+ * @param {string|number} chatId - ID del chat destino.
+ * @param {string} text - Contenido del mensaje (HTML de Telegram; escapa el texto del usuario con `_escapeHtml`).
+ * @returns {boolean} true si TODAS las partes se entregaron; false si falló alguna.
+ */
+function sendTelegramMessage(chatId, text) {
+  const cleanToken = (getEnv('TELEGRAM_BOT_TOKEN') || '').trim();
+  if (!cleanToken || !chatId) return false;
+
+  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
+  const parts = _splitMessage(text, CONFIG.LIMITS.TELEGRAM_MESSAGE_MAX);
+  if (parts.length === 0) return false;
+
+  let allDelivered = true;
+  parts.forEach((part) => {
+    const res = _postTelegram(url, { chat_id: String(chatId), text: part, parse_mode: 'HTML' });
+    if (res && res.getResponseCode() === 200) return;
+
+    if (res && res.getResponseCode() === 400 && /parse entities/i.test(res.getContentText())) {
+      const plain = _postTelegram(url, { chat_id: String(chatId), text: part.replace(/<[^>]+>/g, '') });
+      if (plain && plain.getResponseCode() === 200) {
+        console.warn('⚠️ Telegram rechazó el HTML del mensaje; se envió como texto plano.');
+        return;
+      }
+    }
+
+    allDelivered = false;
+    console.error(`❌ Telegram no entregó el mensaje (código ${res ? res.getResponseCode() : 'sin respuesta'}): ${res ? _truncate(res.getContentText(), 300) : ''}`);
+  });
+
+  return allDelivered;
+}
+
+/**
+ * Registra un update de Telegram para no procesarlo dos veces (Telegram reintenta el webhook
+ * si tarda en responder). Los `update_id` son crecientes, así que basta con recordar el último.
+ * @private
+ * @param {number} updateId - `update_id` del update recibido.
+ * @returns {boolean} true si el update es nuevo (y queda registrado); false si ya se procesó.
+ */
+function _registerUpdate(updateId) {
+  if (typeof updateId !== 'number') return true;
+
+  const props = PropertiesService.getScriptProperties();
+  const last = parseInt(props.getProperty('LAST_UPDATE_ID') || '0', 10);
+  if (updateId <= last) return false;
+
+  props.setProperty('LAST_UPDATE_ID', String(updateId));
+  return true;
+}
+
+/**
+ * Endpoint de entrada (Webhook). Procesa todos los mensajes entrantes de Telegram. Siempre
+ * responde 200 rápido para que Telegram no reintente; el trabajo se hace bajo el lock de script
+ * y con dedupe por `update_id`.
+ * @param {GoogleAppsScript.Events.DoPost} e - Evento POST proporcionado por Google Apps Script.
+ * @returns {GoogleAppsScript.HTML.HtmlOutput} Respuesta vacía (ACK).
  */
 function doPost(e) {
-  // Obligatorio: Retornar HTTP 200 rápido para que Telegram no reintente
   const ACK = HtmlService.createHtmlOutput();
-  
+
   try {
     const secretToken = getEnv('TELEGRAM_SECRET_TOKEN');
 
     // 1. Escudo de Seguridad: Token del Webhook
-    if (!e.parameter.token || e.parameter.token !== secretToken) {
+    if (!secretToken || !e.parameter || !e.parameter.token || e.parameter.token !== secretToken) {
       console.warn('❌ ERROR ESCUDO 1: Token de seguridad de URL inválido.');
       return ACK;
     }
 
     const update = JSON.parse(e.postData.contents);
-    
-    // Ignorar eventos que no sean mensajes de texto
-    if (!update.message || !update.message.text) {
-      return ACK;
-    }
 
-    const chatId = update.message.chat.id.toString();
+    // Ignorar eventos que no sean mensajes de texto
+    if (!update.message || !update.message.text) return ACK;
+
+    const chatId = String(update.message.chat.id);
     const text = update.message.text.trim();
-    const expectedChatId = getEnv('TELEGRAM_CHAT_ID');
-    
+
     // 2. Escudo de Seguridad: Chat ID Autorizado
-    if (chatId !== expectedChatId) {
+    if (chatId !== String(getEnv('TELEGRAM_CHAT_ID'))) {
       console.warn(`❌ ERROR ESCUDO 2: Intento de acceso no autorizado desde Chat ID: ${chatId}`);
       return ACK;
     }
 
-    // --- ENRUTADOR DE COMANDOS ---
-    
-    // Comando Start / Hola
-    if (text === '/start' || text.toLowerCase() === 'hola') {
-      sendTelegramMessage(chatId, "🤖 ¡Hola! Soy tu gestor de Inversiones. Cuando detecte un nuevo DAP, te avisaré por aquí.");
-      return ACK;
-    }
-    
-    // Comando /version: permite comprobar qué versión del código ejecuta el Web App desplegado
-    if (text.toLowerCase() === '/version') {
-      sendTelegramMessage(chatId, `🧩 Versión del código en ejecución: <code>${APP_VERSION}</code>`);
-      return ACK;
-    }
-
-    // Comando Manual de Liquidación
-    if (text.toLowerCase().startsWith('/liquidar')) {
-      const parts = text.split(' ');
-      if (parts.length < 2) {
-        sendTelegramMessage(chatId, "⚠️ Formato incorrecto. Usa: <code>/liquidar 1</code>");
-        return ACK;
+    const result = _withScriptLock(() => {
+      if (!_registerUpdate(update.update_id)) {
+        console.info(`ℹ️ Update ${update.update_id} ya procesado; se ignora (reintento de Telegram).`);
+        return;
       }
-      forceLiquidateDap(chatId, parts[1]);
-      return ACK;
+      _routeMessage(chatId, text);
+    }, 25000);
+
+    if (!result.acquired) {
+      sendTelegramMessage(chatId, '⏳ El sistema está ocupado procesando otra operación. Envía tu mensaje de nuevo en unos segundos.');
     }
 
-    // --- MÁQUINA DE ESTADOS (FSM) ---
-    const cache = CacheService.getScriptCache();
-    const activeDapId = cache.get(`${chatId}_ACTIVE_DAP`);
-    const step = cache.get(`${chatId}_DAP_STEP`);
-    
-    if (activeDapId && step) {
-      handleDapConversation(chatId, text, activeDapId, step, cache);
-    } else {
-      sendTelegramMessage(chatId, "No hay ningún DAP pendiente de configuración en este momento.");
-    }
-    
   } catch (error) {
     console.error(`❌ Fallo crítico en doPost: ${error.stack || error.message}`);
+    _alertAdmin('DOPOST_ERROR', `Fallo en el webhook: <code>${_escapeHtml(error.message)}</code>`);
   }
-  
+
   return ACK;
 }
 
 /**
- * Controla la lógica conversacional del bot basándose en el estado actual (FSM).
+ * Endpoint de verificación: devuelve la versión del código que ejecuta el Web App desplegado
+ * (solo con el token secreto). Lo usa `healthCheck()` para detectar despliegues desactualizados.
+ * @param {GoogleAppsScript.Events.DoGet} e - Evento GET proporcionado por Google Apps Script.
+ * @returns {GoogleAppsScript.Content.TextOutput} `APP_VERSION` o "forbidden".
  */
-function handleDapConversation(chatId, text, activeDapId, step, cache) {
-  const spreadsheetId = getEnv('SHARED_SPREADSHEET_ID');
-  const ss = SpreadsheetApp.openById(spreadsheetId);
-  const sheet = ss.getSheetByName(CONFIG.SHEETS.DAPS);
-  const data = sheet.getDataRange().getValues();
-  
-  let rowIndex = -1;
-  let dapRow = null;
-  
-  // Buscar la fila exacta del DAP activo en la caché
-  for (let i = 1; i < data.length; i++) {
-    const idEnHoja = data[i][DAP_COLS.ID_Interno - 1] ? parseInt(data[i][DAP_COLS.ID_Interno - 1], 10) : null;
-    const idEnCache = parseInt(activeDapId, 10);
+function doGet(e) {
+  const secretToken = getEnv('TELEGRAM_SECRET_TOKEN');
+  const authorized = secretToken && e && e.parameter && e.parameter.token === secretToken;
+  return ContentService.createTextOutput(authorized ? APP_VERSION : 'forbidden');
+}
 
-    if (idEnHoja !== null && idEnHoja === idEnCache) {
-      rowIndex = i + 1;
-      dapRow = data[i];
-      break;
+/**
+ * Enruta un mensaje ya autenticado: comandos o respuesta a la conversación activa.
+ * Se ejecuta bajo el lock de script.
+ * @private
+ * @param {string} chatId - ID del chat autorizado.
+ * @param {string} text - Texto del mensaje (sin espacios en los extremos).
+ * @returns {void}
+ */
+function _routeMessage(chatId, text) {
+  const lower = text.toLowerCase();
+
+  if (text === '/start' || lower === 'hola') {
+    sendTelegramMessage(chatId, "🤖 ¡Hola! Soy tu gestor de Inversiones. Cuando detecte un nuevo DAP, te avisaré por aquí.");
+    return;
+  }
+
+  if (lower === '/version') {
+    sendTelegramMessage(chatId, `🧩 Versión del código en ejecución: <code>${APP_VERSION}</code>`);
+    return;
+  }
+
+  const liquidar = text.match(/^\/liquidar(?:@\w+)?(?:\s+(.*))?$/i);
+  if (liquidar) {
+    const argument = (liquidar[1] || '').trim();
+    if (!/^\d+$/.test(argument)) {
+      sendTelegramMessage(chatId, "⚠️ Formato incorrecto. Usa: <code>/liquidar 1</code> (el número es el ID interno del DAP).");
+      return;
     }
-  }
-  
-  if (rowIndex === -1) {
-    console.error(`❌ FSM Error: No se encontró el DAP [${activeDapId}] en la hoja de Sheets.`);
-    return; 
+    forceLiquidateDap(chatId, argument);
+    return;
   }
 
-  // Lógica de transición de estados
-  if (step === 'ESPERANDO_OBJETIVO') {
-    sheet.getRange(rowIndex, DAP_COLS.Objetivo).setValue(text);
+  // Un comando desconocido no debe registrarse como respuesta de la conversación
+  if (text.startsWith('/')) {
+    sendTelegramMessage(chatId, "⚠️ Comando no reconocido. Comandos: <code>/liquidar N</code>, <code>/version</code>.");
+    return;
+  }
 
-    const tipoDap = dapRow[DAP_COLS.Tipo_DAP - 1];
-    if (tipoDap === 'RENOVABLE') {
-      cache.put(`${chatId}_DAP_STEP`, 'ESPERANDO_LIQUIDACION', 21600);
+  // --- MÁQUINA DE ESTADOS (FSM): el DAP activo es la fila en ESPERANDO_TELEGRAM ---
+  const sheet = _openDapSheet();
+  const active = _findActiveConversation(sheet.getDataRange().getValues());
+  if (!active) {
+    sendTelegramMessage(chatId, "No hay ningún DAP pendiente de configuración en este momento.");
+    return;
+  }
+
+  handleDapConversation(chatId, text, sheet, active.rowIndex, active.row);
+}
+
+/**
+ * Marca el paso actual de la conversación de una fila y reinicia su reloj de recordatorios.
+ * @private
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de DAPs.
+ * @param {number} rowIndex - Fila (base 1).
+ * @param {string} step - Valor de CONFIG.STEPS.
+ * @returns {void}
+ */
+function _setConversationStep(sheet, rowIndex, step) {
+  sheet.getRange(rowIndex, DAP_COLS.Paso_Conversacion).setValue(step);
+  sheet.getRange(rowIndex, DAP_COLS.Ultimo_Aviso).setValue(new Date().toISOString());
+  sheet.getRange(rowIndex, DAP_COLS.Avisos_Enviados).setValue(1);
+}
+
+/**
+ * Controla la lógica conversacional del bot para el DAP activo.
+ * @param {string} chatId - ID del chat autorizado.
+ * @param {string} text - Respuesta del usuario.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de DAPs.
+ * @param {number} rowIndex - Fila del DAP activo (base 1).
+ * @param {Array} dapRow - Valores de la fila del DAP activo.
+ * @returns {void}
+ */
+function handleDapConversation(chatId, text, sheet, rowIndex, dapRow) {
+  const step = _getConversationStep(dapRow);
+
+  if (step === CONFIG.STEPS.OBJETIVO) {
+    const objetivo = _validateObjetivo(text);
+    if (!objetivo.ok) {
+      sendTelegramMessage(chatId, `⚠️ ${_escapeHtml(objetivo.error)} Intenta de nuevo.`);
+      return;
+    }
+
+    _setPlainText(sheet, rowIndex, DAP_COLS.Objetivo, objetivo.value);
+
+    if (dapRow[DAP_COLS.Tipo_DAP - 1] === 'RENOVABLE') {
+      _setConversationStep(sheet, rowIndex, CONFIG.STEPS.LIQUIDACION);
       sendTelegramMessage(chatId, _buildLiquidationPrompt(dapRow));
     } else {
       // DAP Fijo: Fecha de liquidación hereda el vencimiento
-      const fechaVencimiento = _toIsoDate(dapRow[DAP_COLS.Fecha_Vencimiento - 1]);
-      sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaVencimiento);
-      finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
+      sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(_toIsoDate(dapRow[DAP_COLS.Fecha_Vencimiento - 1]));
+      finalizeDap(chatId, sheet, rowIndex);
     }
+    return;
+  }
 
-  } else if (step === 'ESPERANDO_LIQUIDACION') {
+  if (step === CONFIG.STEPS.LIQUIDACION) {
     if (text.toLowerCase() === 'saltar') {
       sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue("");
-      finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
+      finalizeDap(chatId, sheet, rowIndex);
       return;
     }
 
     const fechaIngresada = _parseUserDate(text);
     if (!fechaIngresada) {
-      _keepConversationAlive(chatId, activeDapId, cache);
+      _setConversationStep(sheet, rowIndex, CONFIG.STEPS.LIQUIDACION);
       sendTelegramMessage(chatId, "⚠️ No entendí esa fecha. Usa el formato <code>YYYY-MM-DD</code> (ej. <code>2026-07-07</code>) o <code>DD-MM-YYYY</code>.\n<i>Si aún no tienes fecha, responde 'saltar'.</i>");
       return;
     }
@@ -194,7 +283,7 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
     const renewal = _getRenewalInfo(dapRow);
     const check = renewal ? _validateRenewalDate(fechaIngresada, renewal.fecha1, renewal.plazo) : { valid: true };
     if (!check.valid) {
-      _keepConversationAlive(chatId, activeDapId, cache);
+      _setConversationStep(sheet, rowIndex, CONFIG.STEPS.LIQUIDACION);
       sendTelegramMessage(chatId,
         `⚠️ La fecha <b>${_formatDateLong(fechaIngresada)}</b> no cae dentro de una ventana de renovación.\n` +
         `La fecha válida más cercana es <b>${_formatDateLong(check.suggested)}</b> (ventana: ${_formatRenewalWindow(check.window)}).\n\n` +
@@ -203,8 +292,13 @@ function handleDapConversation(chatId, text, activeDapId, step, cache) {
     }
 
     sheet.getRange(rowIndex, DAP_COLS.Fecha_Liquidacion).setValue(fechaIngresada);
-    finalizeDap(chatId, activeDapId, rowIndex, sheet, cache);
+    finalizeDap(chatId, sheet, rowIndex);
+    return;
   }
+
+  console.error(`❌ FSM: paso desconocido "${step}" para la fila ${rowIndex}.`);
+  sendTelegramMessage(chatId, "⚠️ Estado de la conversación desconocido. El administrador fue notificado.");
+  _alertAdmin('FSM_STEP', `Paso de conversación desconocido: <code>${_escapeHtml(step)}</code> (fila ${rowIndex}).`);
 }
 
 /**
@@ -226,81 +320,84 @@ function _buildLiquidationPrompt(dapRow) {
 }
 
 /**
- * Renueva el TTL de la conversación activa (ACTIVE_DAP y DAP_STEP) cuando el usuario debe
- * volver a responder, para que la sesión no expire en medio del reintento.
- * @private
+ * Cierra la conversación, envía el DAP a Notion y libera la cola. Si Notion falla, el DAP queda
+ * en PENDIENTE_NOTION y `retryNotionSync()` lo reintenta automáticamente (nunca se marca
+ * COMPLETADO sin su página en Notion).
+ * @param {string} chatId - ID del chat autorizado.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Hoja de DAPs.
+ * @param {number} rowIndex - Fila del DAP (base 1).
+ * @returns {void}
  */
-function _keepConversationAlive(chatId, activeDapId, cache) {
-  cache.put(`${chatId}_ACTIVE_DAP`, String(activeDapId), 21600);
-  cache.put(`${chatId}_DAP_STEP`, 'ESPERANDO_LIQUIDACION', 21600);
-}
-
-/**
- * Cierra la conversación, envía el objeto a Notion y libera la cola.
- */
-function finalizeDap(chatId, activeDapId, rowIndex, sheet, cache) {
-  // Limpiar Caché Inmediatamente
-  cache.remove(`${chatId}_ACTIVE_DAP`);
-  cache.remove(`${chatId}_DAP_STEP`);
-  
+function finalizeDap(chatId, sheet, rowIndex) {
   sendTelegramMessage(chatId, "⏳ Guardando en la base de datos de Notion...");
 
   // Re-leer los datos actualizados para construir el DTO
-  const data = sheet.getDataRange().getValues();
-  const row = data[rowIndex - 1]; 
-  
+  const row = sheet.getDataRange().getValues()[rowIndex - 1];
   const dapDto = _buildDapDtoFromRow(row);
+  const idInterno = row[DAP_COLS.ID_Interno - 1];
 
-  const notionPageId = pushDapToNotion(dapDto);
-
-  // Actualizar Sheets
-  sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue('COMPLETADO');
-  if (notionPageId) {
-    sheet.getRange(rowIndex, DAP_COLS.Notion_Page_ID).setValue(notionPageId);
-    sendTelegramMessage(chatId, `✅ <b>¡DAP ${activeDapId} registrado exitosamente!</b>\nObjetivo: ${dapDto.Objetivo}`);
-  } else {
-    sendTelegramMessage(chatId, "⚠️ Se guardó en Sheets, pero hubo un error enviando a Notion.");
+  let notionPageId = null;
+  try {
+    notionPageId = pushDapToNotion(dapDto);
+  } catch (error) {
+    console.error(`❌ finalizeDap: excepción al enviar el DAP [${idInterno}] a Notion: ${error.stack || error.message}`);
   }
-  
+
+  sheet.getRange(rowIndex, DAP_COLS.Paso_Conversacion).setValue('');
+  if (notionPageId) {
+    sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue(CONFIG.STATES.COMPLETADO);
+    sheet.getRange(rowIndex, DAP_COLS.Notion_Page_ID).setValue(notionPageId);
+    sheet.getRange(rowIndex, DAP_COLS.Notion_Intentos).setValue(0);
+    sendTelegramMessage(chatId, `✅ <b>¡DAP ${_escapeHtml(idInterno)} registrado exitosamente!</b>\nObjetivo: ${_escapeHtml(dapDto.Objetivo)}`);
+  } else {
+    sheet.getRange(rowIndex, DAP_COLS.Estado_Cola).setValue(CONFIG.STATES.PENDIENTE_NOTION);
+    sheet.getRange(rowIndex, DAP_COLS.Notion_Intentos).setValue(1);
+    sendTelegramMessage(chatId, `⚠️ El DAP ${_escapeHtml(idInterno)} se guardó en Sheets, pero falló el envío a Notion. Lo reintentaré automáticamente.`);
+    _alertAdmin(`NOTION_SYNC_${idInterno}`, `No se pudo enviar el DAP ${_escapeHtml(idInterno)} a Notion; quedó PENDIENTE_NOTION (se reintenta solo).`);
+  }
+
   SpreadsheetApp.flush();
-  
+
   // Desencadenar el siguiente en la cola
-  pingNextPendingDap(); 
+  pingNextPendingDap();
 }
 
 /**
- * Liquida manualmente un DAP mediante un comando de Telegram.
+ * Liquida manualmente un DAP mediante un comando de Telegram. Solo marca el Sheet si Notion
+ * quedó actualizado (o si el DAP no tiene página en Notion), para no dejar ambos desincronizados.
+ * @param {string} chatId - ID del chat autorizado.
+ * @param {string} idInterno - ID interno del DAP (solo dígitos).
+ * @returns {void}
  */
 function forceLiquidateDap(chatId, idInterno) {
-  const spreadsheetId = getEnv('SHARED_SPREADSHEET_ID');
-  const ss = SpreadsheetApp.openById(spreadsheetId);
-  const sheet = ss.getSheetByName(CONFIG.SHEETS.DAPS);
-  const data = sheet.getDataRange().getValues();
+  const sheet = _openDapSheet();
+  const found = _findRowByInternalId(sheet.getDataRange().getValues(), idInterno);
 
-  let rowIndex = -1;
-  let notionPageId = "";
-
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][DAP_COLS.ID_Interno - 1] && parseInt(data[i][DAP_COLS.ID_Interno - 1], 10) === parseInt(idInterno, 10)) {
-      rowIndex = i + 1;
-      notionPageId = data[i][DAP_COLS.Notion_Page_ID - 1];
-      break;
-    }
-  }
-
-  if (rowIndex === -1) {
-    sendTelegramMessage(chatId, `❌ No encontré el registro DAP <b>${idInterno}</b> en la base de datos.`);
+  if (!found) {
+    sendTelegramMessage(chatId, `❌ No encontré el registro DAP <b>${_escapeHtml(idInterno)}</b> en la base de datos.`);
     return;
   }
 
-  let notionMsg = "";
-  if (notionPageId) {
-    const success = updateNotionDapStatus(notionPageId);
-    notionMsg = success ? "\n✅ <i>Base de datos de Notion actualizada.</i>" : "\n⚠️ <i>Falló la actualización en Notion.</i>";
+  const estado = found.row[DAP_COLS.Estado_Cola - 1];
+  if (estado !== CONFIG.STATES.COMPLETADO) {
+    sendTelegramMessage(chatId, `⚠️ El DAP <b>${_escapeHtml(idInterno)}</b> aún no está completado (estado: ${_escapeHtml(estado)}).`);
+    return;
   }
 
-  sheet.getRange(rowIndex, DAP_COLS.Liquidado).setValue(true);
+  if (_isChecked(found.row[DAP_COLS.Liquidado - 1])) {
+    sendTelegramMessage(chatId, `ℹ️ El DAP <b>${_escapeHtml(idInterno)}</b> ya estaba marcado como liquidado.`);
+    return;
+  }
+
+  const notionPageId = found.row[DAP_COLS.Notion_Page_ID - 1];
+  if (notionPageId && !updateNotionDapStatus(notionPageId)) {
+    sendTelegramMessage(chatId, `⚠️ No pude actualizar Notion, así que <b>no</b> marqué el DAP ${_escapeHtml(idInterno)} como liquidado. Reintenta en unos minutos.`);
+    return;
+  }
+
+  sheet.getRange(found.rowIndex, DAP_COLS.Liquidado).setValue(true);
   SpreadsheetApp.flush();
 
-  sendTelegramMessage(chatId, `✅ <b>DAP ${idInterno}</b> marcado como liquidado manualmente.` + notionMsg);
+  sendTelegramMessage(chatId, `✅ <b>DAP ${_escapeHtml(idInterno)}</b> marcado como liquidado manualmente.` +
+    (notionPageId ? "\n✅ <i>Base de datos de Notion actualizada.</i>" : "\nℹ️ <i>El DAP no tiene página en Notion.</i>"));
 }

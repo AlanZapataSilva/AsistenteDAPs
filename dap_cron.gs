@@ -6,106 +6,103 @@
 
 /**
  * Demonio de ejecución diaria. Revisa los DAPs cuya fecha de liquidación haya madurado,
- * los marca como liquidados en Google Sheets y Notion, y envía un reporte consolidado por Telegram.
+ * los marca como liquidados en Notion y luego en Google Sheets, y envía un reporte consolidado
+ * por Telegram. Si Notion falla para un DAP, ese DAP NO se marca (así el Sheet nunca queda por
+ * delante de Notion) y se reintenta en la próxima ejecución diaria.
+ * @returns {void}
  */
 function checkAndLiquidateDaps() {
-  const spreadsheetId = getEnv('SHARED_SPREADSHEET_ID');
-  const chatId = getEnv('TELEGRAM_CHAT_ID');
-  
-  if (!spreadsheetId || !chatId) {
-    console.error('❌ Cron Job: Faltan variables de entorno (SHARED_SPREADSHEET_ID o TELEGRAM_CHAT_ID).');
-    return;
-  }
-
-  // Protección de concurrencia
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) {
-    console.warn('⚠️ Cron Job ocupado: No se pudo obtener el Lock. Se reintentará en la próxima ejecución.');
-    return;
-  }
-
   try {
-    const ss = SpreadsheetApp.openById(spreadsheetId);
-    const sheet = ss.getSheetByName(CONFIG.SHEETS.DAPS);
-    
-    if (!sheet) {
-      console.error(`❌ Cron Job: No se encontró la hoja "${CONFIG.SHEETS.DAPS}".`);
-      return;
-    }
-
-    const data = sheet.getDataRange().getValues();
-
-    // Fecha de hoy estandarizada en la zona horaria del script
-    const todayStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-
-    const dapsLiquidados = [];
-
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      const idInterno = row[DAP_COLS.ID_Interno - 1];
-      const monto = row[DAP_COLS.Monto - 1];
-      const objetivoDAP = row[DAP_COLS.Objetivo - 1] || "Sin Objetivo";
-      const fechaLiqRaw = row[DAP_COLS.Fecha_Liquidacion - 1];
-      const liquidado = row[DAP_COLS.Liquidado - 1];
-      const estadoCola = row[DAP_COLS.Estado_Cola - 1];
-      const notionPageId = row[DAP_COLS.Notion_Page_ID - 1];
-
-      // Saltamos registros no elegibles (ya liquidados, sin fecha de liquidación o con cola incompleta)
-      if (liquidado === true || !fechaLiqRaw || estadoCola !== 'COMPLETADO') {
-        continue;
-      }
-
-      // Estandarización de la fecha de liquidación (Date de Sheets o texto) a yyyy-MM-dd
-      const fechaLiqStr = _toIsoDate(fechaLiqRaw);
-
-      // Evaluación de maduración (si la fecha llegó o es del pasado)
-      if (fechaLiqStr && fechaLiqStr <= todayStr) {
-        // 1. Actualizar Notion remotamente
-        let notionSuccess = false;
-        if (notionPageId) {
-          notionSuccess = updateNotionDapStatus(notionPageId);
-        } else {
-          console.warn(`⚠️ Cron Job: DAP [${idInterno}] no posee Notion_Page_ID. Omitiendo actualización en Notion.`);
-        }
-
-        // 2. Actualizar Google Sheets (columna Liquidado)
-        const rowIndex = i + 1;
-        sheet.getRange(rowIndex, DAP_COLS.Liquidado).setValue(true);
-
-        dapsLiquidados.push({
-          id: idInterno,
-          objetivo: objetivoDAP,
-          monto: monto,
-          notion: notionSuccess
-        });
-      }
-    }
-
-    // Forzar la escritura física en la hoja
-    SpreadsheetApp.flush();
-
-    // 3. Enviar Reporte Consolidado por Telegram
-    if (dapsLiquidados.length > 0) {
-      let msg = `✅ <b>Reporte Diario: DAPs Liquidados</b>\n\n`;
-      msg += `Se han detectado y marcado como liquidados los siguientes DAPs maduros:\n\n`;
-      
-      for (const d of dapsLiquidados) {
-        const montoFormateado = new Intl.NumberFormat('es-CL').format(d.monto);
-        const estadoNotion = d.notion ? '✅ Actualizado' : '⚠️ Error / Omitido';
-        
-        msg += `🔹 [${d.id}] <b>${d.objetivo}</b> ($${montoFormateado})\n`;
-        msg += `   Notion: ${estadoNotion}\n\n`;
-      }
-      
-      sendTelegramMessage(chatId, msg);
-      console.info(`✅ Cron Job: Reporte diario enviado a Telegram con ${dapsLiquidados.length} DAP(s) liquidado(s).`);
-    } else {
-      console.info('ℹ️ Cron Job: Sin DAPs maduros pendientes de liquidación el día de hoy.');
-    }
-
+    const result = _withScriptLock(() => _liquidateMaturedDaps(), 10000);
+    if (!result.acquired) console.warn('⚠️ Cron Job ocupado: No se pudo obtener el Lock. Se reintentará en la próxima ejecución.');
   } catch (error) {
     console.error(`❌ Error CRÍTICO en checkAndLiquidateDaps: ${error.stack || error.message}`);
-  } finally {
-    lock.releaseLock();
+    _alertAdmin('CRON_ERROR', `Fallo en la liquidación diaria: <code>${_escapeHtml(error.message)}</code>`);
   }
+}
+
+/**
+ * Lógica de `checkAndLiquidateDaps` (debe ejecutarse bajo el lock de script).
+ * @private
+ * @returns {void}
+ */
+function _liquidateMaturedDaps() {
+  const chatId = getEnv('TELEGRAM_CHAT_ID');
+  if (!chatId) {
+    console.error('❌ Cron Job: Falta TELEGRAM_CHAT_ID en las propiedades.');
+    return;
+  }
+
+  const sheet = _openDapSheet();
+  const data = sheet.getDataRange().getValues();
+  const todayStr = _todayIso();
+
+  const liquidated = [];
+  const failed = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const idInterno = row[DAP_COLS.ID_Interno - 1];
+
+    // Solo DAPs COMPLETADOS, sin liquidar y con fecha de liquidación llegada o pasada
+    if (row[DAP_COLS.Estado_Cola - 1] !== CONFIG.STATES.COMPLETADO || _isChecked(row[DAP_COLS.Liquidado - 1])) continue;
+    const fechaLiqStr = _toIsoDate(row[DAP_COLS.Fecha_Liquidacion - 1]);
+    if (!fechaLiqStr || fechaLiqStr > todayStr) continue;
+
+    const info = {
+      id: idInterno,
+      objetivo: row[DAP_COLS.Objetivo - 1] || 'Sin Objetivo',
+      monto: row[DAP_COLS.Monto - 1]
+    };
+
+    try {
+      // 1. Notion primero: si falla, no se marca el Sheet y se reintenta mañana
+      const notionPageId = row[DAP_COLS.Notion_Page_ID - 1];
+      if (notionPageId) {
+        if (!updateNotionDapStatus(notionPageId)) {
+          failed.push(info);
+          continue;
+        }
+      } else {
+        console.warn(`⚠️ Cron Job: DAP [${idInterno}] no posee Notion_Page_ID. Se marca solo en el Sheet.`);
+      }
+
+      // 2. Google Sheets (columna Liquidado)
+      sheet.getRange(i + 1, DAP_COLS.Liquidado).setValue(true);
+      liquidated.push(Object.assign({ notion: Boolean(notionPageId) }, info));
+    } catch (error) {
+      console.error(`❌ Cron Job: error liquidando el DAP [${idInterno}]: ${error.stack || error.message}`);
+      failed.push(info);
+    }
+  }
+
+  // Forzar la escritura física en la hoja
+  SpreadsheetApp.flush();
+
+  if (liquidated.length === 0 && failed.length === 0) {
+    console.info('ℹ️ Cron Job: Sin DAPs maduros pendientes de liquidación el día de hoy.');
+    return;
+  }
+
+  const formatMonto = (monto) => new Intl.NumberFormat('es-CL').format(monto || 0);
+  let msg = '';
+
+  if (liquidated.length > 0) {
+    msg += `✅ <b>Reporte Diario: DAPs Liquidados</b>\n\n`;
+    msg += `Se han detectado y marcado como liquidados los siguientes DAPs maduros:\n\n`;
+    liquidated.forEach((d) => {
+      msg += `🔹 [${_escapeHtml(d.id)}] <b>${_escapeHtml(d.objetivo)}</b> ($${formatMonto(d.monto)})\n`;
+      msg += `   Notion: ${d.notion ? '✅ Actualizado' : 'ℹ️ Sin página en Notion'}\n\n`;
+    });
+  }
+
+  if (failed.length > 0) {
+    msg += `⚠️ <b>No pude actualizar Notion para estos DAPs maduros</b> (no se marcaron; se reintentará mañana):\n\n`;
+    failed.forEach((d) => {
+      msg += `🔸 [${_escapeHtml(d.id)}] <b>${_escapeHtml(d.objetivo)}</b> ($${formatMonto(d.monto)})\n`;
+    });
+  }
+
+  sendTelegramMessage(chatId, msg);
+  console.info(`✅ Cron Job: Reporte diario enviado (${liquidated.length} liquidado(s), ${failed.length} con error).`);
 }

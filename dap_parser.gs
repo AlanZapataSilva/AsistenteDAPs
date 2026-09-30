@@ -1,5 +1,8 @@
 /**
  * @fileoverview dap_parser.gs - Motor de extracción de datos (Regex) para DAPs.
+ * El parser es ESTRICTO: si un dato obligatorio falta o no es coherente, falla con un código de
+ * error explícito en vez de inventar un valor por defecto (un DAP mal registrado es peor que un
+ * DAP pendiente de revisión).
  */
 
 'use strict';
@@ -15,6 +18,16 @@
  * @property {string} Tipo_DAP - Clasificación del DAP (FIJO o RENOVABLE).
  * @property {string} Fecha_Inicio - Fecha de toma en formato YYYY-MM-DD.
  * @property {string} Fecha_Vencimiento - Fecha de maduración en formato YYYY-MM-DD.
+ */
+
+/**
+ * Resultado del parseo de un correo.
+ * @typedef {Object} ParseResult
+ * @property {boolean} ok - true si se extrajo un DAP válido.
+ * @property {DapDTO} [dto] - DAP extraído (solo si ok).
+ * @property {{code: string, message: string}} [error] - Motivo del fallo (solo si !ok). Códigos:
+ *   CUERPO_VACIO, MONEDA_NO_SOPORTADA, SIN_MONTO, SIN_OPERACION, MONTO_INVALIDO,
+ *   TIPO_DESCONOCIDO, FECHA_INVALIDA, FECHAS_INCOHERENTES, EXCEPCION.
  */
 
 // "Gap" entre una etiqueta y su valor. Reglas (ver AGENTS.md, "Email Regex Line-Crossing"):
@@ -40,6 +53,8 @@ const DAP_BCI_LOGIC = Object.freeze({
     MONTO: new RegExp('(?:Monto Inversi.*n|Monto|Capital)(' + _GAP + ')([\\d.,]+)', 'i'),
     // Campo "Moneda" de la tabla (valor "UF" o "Pesos"); señal adicional a la del prefijo del monto
     MONEDA: /Moneda[\s:]*(UF|Pesos)\b/i,
+    // Monedas extranjeras: no están soportadas y NO deben registrarse como pesos
+    MONEDA_EXTRANJERA: /Moneda[\s:]*(USD|US\$|D[oó]lar(?:es)?|EUR|Euros?|GBP|Libras?)/i,
     // Atrapa "Tipo de Documento" y busca la palabra "Fijo" o "Renovable" (cruza líneas a propósito,
     // de forma perezosa: se queda con la primera aparición)
     TIPO: /(?:Tipo de Documento|Tipo de Dep.sito|Tipo)[\s\S]*?(Fijo|Renovable)/i,
@@ -81,72 +96,139 @@ function _extractIdOperacion(body) {
 }
 
 /**
- * Procesa un correo de DAP del BCI y extrae los datos clave.
- * @param {GoogleAppsScript.Gmail.GmailMessage} message - Mensaje de Gmail a procesar.
- * @returns {DapDTO|null} Objeto DTO del DAP o null si la extracción falla.
+ * Convierte el HTML de un correo a texto plano preservando la estructura de filas: cada celda
+ * o bloque termina en un salto de línea y las entidades HTML se decodifican. Se usa solo cuando
+ * el correo no trae versión de texto plano.
+ * @private
+ * @param {string} html - Cuerpo HTML del correo.
+ * @returns {string} Texto plano.
  */
-function parseBciDapEmail(message) {
+function _htmlToText(html) {
+  const entities = {
+    nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", deg: '°',
+    aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ', uuml: 'ü',
+    Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ', Uuml: 'Ü'
+  };
+
+  return String(html)
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, '')
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\/(td|th|tr|p|div|li|h[1-6]|table)\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&#(\d+);/g, (match, code) => String.fromCharCode(parseInt(code, 10)))
+    .replace(/&([a-zA-Z]+);/g, (match, name) => (Object.prototype.hasOwnProperty.call(entities, name) ? entities[name] : match))
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+/**
+ * Interpreta una fecha de un correo: `DD-MM-YYYY`, `DD/MM/YYYY` o `YYYY-MM-DD` (con `-` o `/`).
+ * @private
+ * @param {string|null|undefined} raw - Texto extraído del correo.
+ * @returns {string|null} Fecha ISO (YYYY-MM-DD), o null si el formato o la fecha no son válidos.
+ */
+function _parseEmailDate(raw) {
+  const value = String(raw === null || raw === undefined ? '' : raw).trim();
+  let year;
+  let month;
+  let day;
+
+  let match = value.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (match) {
+    year = parseInt(match[1], 10); month = parseInt(match[2], 10); day = parseInt(match[3], 10);
+  } else {
+    match = value.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+    if (!match) return null;
+    day = parseInt(match[1], 10); month = parseInt(match[2], 10); year = parseInt(match[3], 10);
+  }
+
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * Procesa un correo de DAP del BCI y extrae los datos clave, con validación estricta.
+ * No lanza excepciones: cualquier problema se devuelve como `{ok: false, error}`.
+ * @param {GoogleAppsScript.Gmail.GmailMessage} message - Mensaje de Gmail a procesar.
+ * @returns {ParseResult} Resultado del parseo.
+ */
+function parseBciDapEmailDetailed(message) {
+  const fail = (code, detail) => ({ ok: false, error: { code: code, message: detail } });
+
   try {
-    const body = message.getPlainBody() || message.getBody().replace(/<[^>]+>/g, ' ');
+    let body = message.getPlainBody();
+    if (!body || !body.trim()) body = _htmlToText(message.getBody() || '');
+    if (!body || !body.trim()) return fail('CUERPO_VACIO', 'El correo no tiene contenido legible.');
+
     const regex = DAP_BCI_LOGIC.REGEX;
 
-    const matchMonto = body.match(regex.MONTO);
-    const matchMoneda = body.match(regex.MONEDA);
-    const idOperacion = _extractIdOperacion(body);
-    const matchTipo = body.match(regex.TIPO);
-    const matchInicio = body.match(regex.FECHA_INICIO);
-    const matchVencimiento = body.match(regex.FECHA_VENCIMIENTO);
+    const foreign = body.match(regex.MONEDA_EXTRANJERA);
+    if (foreign) return fail('MONEDA_NO_SOPORTADA', `Moneda no soportada: "${foreign[1]}".`);
 
-    if (!matchMonto || !idOperacion) {
-      console.warn(`⚠️ Parser BCI: No se pudo extraer Monto u Operación del correo: "${message.getSubject()}"`);
-      return null;
-    }
+    const matchMonto = body.match(regex.MONTO);
+    if (!matchMonto) return fail('SIN_MONTO', 'No se encontró el monto de la inversión.');
+
+    const idOperacion = _extractIdOperacion(body);
+    if (!idOperacion) return fail('SIN_OPERACION', 'No se encontró el número de depósito/operación.');
 
     // Moneda: UF si el prefijo del monto o el campo "Moneda" lo indican; en otro caso CLP.
-    // UF usa coma decimal ("4,4379"); CLP es un entero con puntos de miles ("61.000").
+    // UF usa coma decimal ("4,4379"); CLP es un entero con separadores de miles.
+    const matchMoneda = body.match(regex.MONEDA);
     const esUF = /\bUF\b/i.test(matchMonto[1]) || (matchMoneda !== null && /^UF$/i.test(matchMoneda[1]));
-    const moneda = esUF ? 'UF' : 'CLP';
     const montoOriginal = esUF
       ? _parseFlexibleNumber(matchMonto[2])
       : parseInt(matchMonto[2].replace(/[^\d]/g, ''), 10);
-    const tipoLimpio = matchTipo ? matchTipo[1].trim().toUpperCase() : 'FIJO';
-    const messageDate = message.getDate();
+    if (!Number.isFinite(montoOriginal) || montoOriginal <= 0) {
+      return fail('MONTO_INVALIDO', `Monto no interpretable: "${matchMonto[2]}".`);
+    }
+
+    const matchTipo = body.match(regex.TIPO);
+    if (!matchTipo) return fail('TIPO_DESCONOCIDO', 'No se pudo determinar si el DAP es Fijo o Renovable.');
+
+    const matchInicio = body.match(regex.FECHA_INICIO);
+    const matchVencimiento = body.match(regex.FECHA_VENCIMIENTO);
+    const fechaInicio = _parseEmailDate(matchInicio && matchInicio[1]);
+    const fechaVencimiento = _parseEmailDate(matchVencimiento && matchVencimiento[1]);
+    if (!fechaInicio || !fechaVencimiento) {
+      return fail('FECHA_INVALIDA', `Fechas no interpretables (captación: "${matchInicio && matchInicio[1]}", vencimiento: "${matchVencimiento && matchVencimiento[1]}").`);
+    }
+    if (fechaVencimiento <= fechaInicio) {
+      return fail('FECHAS_INCOHERENTES', `El vencimiento (${fechaVencimiento}) no es posterior a la captación (${fechaInicio}).`);
+    }
 
     return {
-      ID_Operacion: idOperacion.trim(),
-      Moneda: moneda,
-      Monto_Original: montoOriginal,
-      // En UF el monto en CLP se calcula después (requiere consultar el valor de la UF a la fecha de captación)
-      Monto: esUF ? null : montoOriginal,
-      Tipo_DAP: tipoLimpio,
-      Fecha_Inicio: _normalizeDate(matchInicio ? matchInicio[1] : null, messageDate),
-      Fecha_Vencimiento: _normalizeDate(matchVencimiento ? matchVencimiento[1] : null, messageDate)
+      ok: true,
+      dto: {
+        ID_Operacion: idOperacion.trim(),
+        Moneda: esUF ? 'UF' : 'CLP',
+        Monto_Original: montoOriginal,
+        // En UF el monto en CLP se calcula después (requiere consultar el valor de la UF a la fecha de captación)
+        Monto: esUF ? null : montoOriginal,
+        Tipo_DAP: matchTipo[1].trim().toUpperCase(),
+        Fecha_Inicio: fechaInicio,
+        Fecha_Vencimiento: fechaVencimiento
+      }
     };
 
   } catch (error) {
-    console.error(`❌ Error en parseBciDapEmail: ${error.message}`);
-    return null;
+    return fail('EXCEPCION', error.message);
   }
 }
 
 /**
- * Estandariza las fechas extraídas al formato ISO (YYYY-MM-DD).
- * @private
- * @param {string|null} rawDate - Cadena de texto extraída (Ej: 30/12/2026).
- * @param {Date} fallbackDate - Fecha del correo para usar como respaldo en caso de fallar.
- * @returns {string} Fecha estandarizada en formato YYYY-MM-DD.
+ * Procesa un correo de DAP del BCI. Envoltorio de `parseBciDapEmailDetailed` que devuelve solo
+ * el DTO (o null si falla, registrando el motivo).
+ * @param {GoogleAppsScript.Gmail.GmailMessage} message - Mensaje de Gmail a procesar.
+ * @returns {DapDTO|null} Objeto DTO del DAP o null si la extracción falla.
  */
-function _normalizeDate(rawDate, fallbackDate) {
-  if (!rawDate) {
-    return Utilities.formatDate(fallbackDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+function parseBciDapEmail(message) {
+  const result = parseBciDapEmailDetailed(message);
+  if (!result.ok) {
+    let subject = '';
+    try { subject = message.getSubject(); } catch (error) { subject = '(sin asunto)'; }
+    console.warn(`⚠️ Parser BCI [${result.error.code}]: ${result.error.message} (asunto: "${subject}")`);
+    return null;
   }
-  
-  const parts = rawDate.trim().split(/[-/]/);
-  
-  // Transforma DD/MM/YYYY a YYYY-MM-DD
-  if (parts.length === 3) {
-    return `${parts[2]}-${parts[1]}-${parts[0]}`;
-  }
-  
-  return rawDate;
+  return result.dto;
 }
