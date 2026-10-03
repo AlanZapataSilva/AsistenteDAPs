@@ -1,0 +1,5 @@
+# Solo se sube a Apps Script el codigo del runtime: *.gs y appsscript.json.
+# Todo lo demas (tests, node_modules, docs, tooling) se queda en local.
+**/**
+!appsscript.json
+!*.gs

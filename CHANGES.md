@@ -1,5 +1,18 @@
 # Registro de cambios
 
+## 2026-10-03 — Flujo local ↔ Apps Script con `clasp` (sin cambio de código; `APP_VERSION` sigue en 2026-10-02.1)
+
+**Problema**: el código llegaba a Apps Script importándolo a mano desde GitHub y cada despliegue exigía crear la versión del Web App a mano (causa del hallazgo H13, "Web App desactualizado").
+
+**Cambio**: desde ahora el código se edita en local y se sube con `clasp`; GitHub queda solo para colaboración y versionamiento.
+- Antes de adoptarlo se bajó el proyecto remoto y se comparó: los 17 `.gs` y `appsscript.json` eran idénticos a `main`.
+- `@google/clasp` local actualizado de 2.x a **3.4.1** (la 2.x no leía las credenciales de `~/.clasprc.json` generadas por la 3.x).
+- `.claspignore` (versionado): solo se suben `*.gs` y `appsscript.json`; los `.js` de `tests/` y `node_modules/` nunca llegan a Apps Script. `.clasp.json.example` pasa a versionarse (plantilla); `.clasp.json` (scriptId) y `.clasp.deploy.json` (ID del deployment del Web App) quedan locales.
+- Scripts de npm: `push` (`clasp push --force`: el local es la fuente de verdad; sin `--force` clasp se salta el push porque el manifiesto remoto no termina en salto de línea), `pull`, `status` y `deploy` (`scripts/deploy.js`: tests + lint → push → nueva versión en el deployment existente, misma URL, con `APP_VERSION` como descripción).
+- Documentado en `README.md` (*Flujo de trabajo*) y `AGENTS.md` (Quick Start, Runbook → Deploy/Rollback, Local Development).
+
+**Pasos para el dueño**: ninguno obligatorio. Verificar con `/version` qué versión corre el Web App: el deployment estaba fijado en la versión 11 de Apps Script; si no responde `2026-10-02.1`, ejecutar `npm run deploy`. Tests: 356 (sin cambios).
+
 ## 2026-10-02 — Correos de liquidación y monto final de los DAP (versión 2026-10-02.1)
 
 **Problema**: muchos DAP liquidados (sobre todo renovables) no figuraban como liquidados: el sistema solo leía el correo de toma y el cron marcaba por la fecha tentativa; el correo "Comprobante de liquidación de Depósito a plazo" no se monitoreaba. Además no quedaba registrado el monto final de ningún DAP.

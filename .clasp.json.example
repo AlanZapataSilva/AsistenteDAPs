@@ -1,0 +1,8 @@
+{
+  "scriptId": "REPLACE_WITH_YOUR_APPS_SCRIPT_ID",
+  "rootDir": ".",
+  "scriptExtensions": [".gs"],
+  "htmlExtensions": [],
+  "jsonExtensions": [".json"],
+  "skipSubdirectories": true
+}

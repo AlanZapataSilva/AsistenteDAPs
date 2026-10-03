@@ -29,7 +29,7 @@ Hechos de plataforma verificados en la documentación oficial de Apps Script (no
 | H10 | Estado de la conversación en caché (evictable) y sin watchdog | Estado durable en el Sheet (`Paso_Conversacion`, `Ultimo_Aviso`, `Avisos_Enviados`); `watchdogTick` horario con recordatorios (máx. 3) y alerta | Corregido |
 | H11 | Sin alertas ni health check | `_alertAdmin` (throttle 1 h por clave) en todos los `catch`; `healthCheck()` diario; `parserCanary()` semanal | Corregido |
 | H12 | Endpoint público protegido solo por token en la URL + `chat_id` (no secreto); remitente `from:bci.cl` sin validar | Remitente validado por dominio exacto/subdominio; token débil detectado por `healthCheck`. **Pendiente (hoja de ruta):** eliminar el endpoint público (polling o proxy que valide el header `secret_token`) y verificar DKIM | Parcial |
-| H13 | Despliegue manual → Web App desactualizado (ya ocurrió) | `doGet` devuelve `APP_VERSION`; `healthCheck` compara la versión desplegada con la del código y alerta; `/version` en el bot. **Pendiente (hoja de ruta):** despliegue automático con `clasp` en CI | Parcial |
+| H13 | Despliegue manual → Web App desactualizado (ya ocurrió) | `doGet` devuelve `APP_VERSION`; `healthCheck` compara la versión desplegada con la del código y alerta; `/version` en el bot. Desde 2026-10-03 el despliegue es con `clasp` (`npm run deploy`: tests + lint + push + nueva versión del Web App). **Pendiente (hoja de ruta):** ejecutarlo en CI | Mitigado |
 
 ## Hallazgos de severidad MEDIA
 
@@ -72,9 +72,9 @@ Correo sin texto plano · plantilla nueva/antigua de BCI (2 y 3 celdas, con y si
 ## Suposiciones y verificaciones pendientes en producción
 
 1. **Exclusión `-label:`**: `healthCheck()` la prueba automáticamente en cuanto exista al menos un hilo etiquetado; revisar su primer informe.
-2. **`oauthScopes` explícitos**: si al importar Apps Script pide permisos o falla por "scope insuficiente", volver a autorizar ejecutando cualquier función; como último recurso, quitar `oauthScopes` de `appsscript.json`.
+2. **`oauthScopes` explícitos**: si al subir el código Apps Script pide permisos o falla por "scope insuficiente", volver a autorizar ejecutando cualquier función; como último recurso, quitar `oauthScopes` de `appsscript.json`.
 3. **Respaldo de UF (mindicador.cl)**: el formato de respuesta se leyó de su documentación pública y el parseo es tolerante (`serie[0].valor` o `valor`); se ejercita solo si falla la CMF.
-4. **Nueva versión del Web App**: tras importar, crear una nueva versión de la implementación y comprobar `/version` (el `healthCheck` diario también lo verifica).
+4. **Nueva versión del Web App**: tras subir el código, crear una nueva versión de la implementación (`npm run deploy`) y comprobar `/version` (el `healthCheck` diario también lo verifica).
 5. **Correos de liquidación (`dap_liquidation.gs`)**: el parser se validó con **una sola plantilla real** (DAP renovable en pesos, `contacto@bci.cl`). No hay muestra real de una liquidación de DAP **en UF** ni de un DAP **fijo**: el formato del monto/moneda en UF y el caso "DAP en UF pagado en pesos" son suposiciones cubiertas por tests sintéticos. Al llegar la primera de cada tipo, revisar el resultado (log / aviso de Telegram) y agregar su fixture anonimizado a `tests/parser.test.js`.
 6. **Un correo de liquidación por DAP renovable**: se asume que BCI envía el comprobante solo al liquidar (no en cada renovación automática). Si enviara uno por renovación, un renovable quedaría marcado como liquidado en la primera; se notaría porque el segundo correo del mismo N° de depósito quedaría como "repetido" (el monto guardado se conserva y, si el monto del correo difiere, el log lo advierte). Verificar con los primeros casos reales.
 7. **Creación de la propiedad `Monto final` en Notion**: `installDapApp()` la crea con la API (`PATCH /databases`); depende de que la integración pueda editar la base. Si no puede, el log lo indica y hay que crearla a mano (Número, nombre exacto `Monto final`); `healthCheck` la exige.

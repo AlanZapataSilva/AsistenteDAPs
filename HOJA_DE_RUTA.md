@@ -36,7 +36,7 @@ Ideas priorizadas por **valor** (V) y **esfuerzo** (E), de 1 (bajo) a 3 (alto). 
 
 | Idea | V | E | Detalle |
 |---|---|---|---|
-| Fase 3: DevOps | 3 | 2 | Llevar `package.json`, tests y ESLint al repo con `.claspignore`; GitHub Actions (lint, tests, type-check); `clasp push` + `clasp deploy --deploymentId` automático. Elimina la clase de errores "Web App desactualizado". |
+| Fase 3: DevOps | 3 | 2 | **Hecho (2026-10-03):** `.claspignore` y `npm run deploy` local (tests + lint + `clasp push` + `clasp deploy --deploymentId`). **Pendiente:** llevar `package.json`, tests y ESLint al repo y GitHub Actions (lint, tests, type-check; el despliegue desde CI necesitaría credenciales de clasp como secreto). Elimina la clase de errores "Web App desactualizado". |
 | Eliminar el endpoint público | 3 | 3 | Hoy `doPost` es público y protegido por token en la URL + `chat_id`. Alternativas: *polling* (`getUpdates`, sin endpoint) con trigger de 1 min, o un proxy (Cloudflare Worker) que valide el header `X-Telegram-Bot-Api-Secret-Token` y reenvíe. |
 | Verificar autenticidad del correo | 2 | 2 | Leer `Authentication-Results` (DKIM/SPF) con la API avanzada de Gmail en vez de confiar en el `From`. |
 | Migrar a la API de Notion con *data sources* | 2 | 2 | Cambiar `Notion-Version` (hoy `2022-06-28`) y usar `data_source_id`; planificar antes de que retiren la versión actual. |
